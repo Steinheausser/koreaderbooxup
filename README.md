@@ -1,5 +1,7 @@
 # KOReader for Onyx Boox (Hardware Low-Latency Stylus)
 
+Work in progress. Also, this is entirely vibe-coded slop. Please, if you wish to use this, take your usual precautions / avoidance.
+
 Custom KOReader distribution and modular plugin providing **hardware-accelerated, low-latency stylus annotations** on Onyx Boox E-ink devices (tested for **Max Lumi 2020**, **Boox OS 3.5+**, **Android 10+**).
 
 ---
