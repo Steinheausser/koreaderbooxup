@@ -20,7 +20,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $LauncherDir = Join-Path $Root "android-launcher"
 $AssetsDir = Join-Path $LauncherDir "assets"
-$LibsDir = Join-Path $LauncherDir "app\libs"
+$LibsDir = Join-Path $LauncherDir "libs"
 $TempDir = Join-Path $Root "temp_apk_extract"
 
 Write-Host "====================================================" -ForegroundColor Cyan

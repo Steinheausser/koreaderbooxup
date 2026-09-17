@@ -56,10 +56,20 @@ try {
     $TaskName = "assembleArm64Rocks$BuildType"
     Write-Host "[*] Executing Gradle task: $TaskName..." -ForegroundColor Yellow
     
+    $DestName = "KOReader-Boox-Stylus-$BuildType.apk"
+    $FinalPath = Join-Path $OutputDir $DestName
+    if (Test-Path $FinalPath) {
+        Remove-Item -Force $FinalPath
+    }
+
     if (Test-Path ".\gradlew.bat") {
         .\gradlew.bat $TaskName --stacktrace
     } else {
         java -cp "gradle\wrapper\gradle-wrapper.jar" org.gradle.wrapper.GradleWrapperMain $TaskName --stacktrace
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Gradle build failed with exit code $LASTEXITCODE"
     }
 
     # Locate generated APK
