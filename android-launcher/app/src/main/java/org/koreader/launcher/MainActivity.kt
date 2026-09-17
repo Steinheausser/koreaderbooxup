@@ -169,11 +169,6 @@ class MainActivity : NativeActivity(), LuaInterface,
         intent = null
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        OnyxPenBridge.onDestroy()
-    }
-
     override fun surfaceCreated(holder: SurfaceHolder) {
         super.surfaceCreated(holder)
         drawSplashScreen(holder)
@@ -263,6 +258,7 @@ class MainActivity : NativeActivity(), LuaInterface,
     public override fun onDestroy() {
         Log.v(tag, "onDestroy()")
         unregisterReceiver(event)
+        OnyxPenBridge.onDestroy()
         super.onDestroy()
     }
 

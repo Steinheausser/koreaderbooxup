@@ -188,14 +188,6 @@ enum {
 };
 
 enum {
-    AMOTION_EVENT_TOOL_TYPE_UNKNOWN = 0,
-    AMOTION_EVENT_TOOL_TYPE_FINGER = 1,
-    AMOTION_EVENT_TOOL_TYPE_STYLUS = 2,
-    AMOTION_EVENT_TOOL_TYPE_MOUSE = 3,
-    AMOTION_EVENT_TOOL_TYPE_ERASER = 4
-};
-
-enum {
     AINPUT_SOURCE_CLASS_MASK = 0x000000ff,
     AINPUT_SOURCE_CLASS_BUTTON = 0x00000001,
     AINPUT_SOURCE_CLASS_POINTER = 0x00000002,
@@ -631,7 +623,6 @@ float AMotionEvent_getTouchMajor(const AInputEvent* motion_event, size_t pointer
 float AMotionEvent_getTouchMinor(const AInputEvent* motion_event, size_t pointer_index);
 float AMotionEvent_getToolMajor(const AInputEvent* motion_event, size_t pointer_index);
 float AMotionEvent_getToolMinor(const AInputEvent* motion_event, size_t pointer_index);
-int32_t AMotionEvent_getToolType(const AInputEvent* motion_event, size_t pointer_index);
 float AMotionEvent_getOrientation(const AInputEvent* motion_event, size_t pointer_index);
 size_t AMotionEvent_getHistorySize(const AInputEvent* motion_event);
 int64_t AMotionEvent_getHistoricalEventTime(const AInputEvent* motion_event,
@@ -1935,16 +1926,6 @@ local function run(android_app_state)
         end)
     end
 
-    android.hasBrokenTouchReport = function()
-        return JNI:context(android.app.activity.vm, function(jni)
-            return jni:callBooleanMethod(
-                android.app.activity.clazz,
-                "hasBrokenTouchReport",
-                "()Z"
-            )
-        end)
-    end
-
     android.setHapticOverride = function(enable)
         android.hapticOverride = enable or false
     end
@@ -1991,7 +1972,6 @@ local function run(android_app_state)
     -- device properties
     android.prop.version = android.getVersion()
     android.prop.brokenLifecycle = android.hasBrokenLifecycle()
-    android.prop.brokenTouchReport = android.hasBrokenTouchReport()
 
     -- update logger name
     android.log_name = android.prop.name
@@ -2404,73 +2384,6 @@ local function run(android_app_state)
             jni:callVoidMethod(
                 android.app.activity.clazz,
                 "startTestActivity",
-                "()V"
-            )
-        end)
-    end
-
-    -- Onyx Boox low-latency stylus bridge
-    android.booxIsSupported = function()
-        return JNI:context(android.app.activity.vm, function(jni)
-            return jni:callBooleanMethod(
-                android.app.activity.clazz,
-                "booxIsSupported",
-                "()Z"
-            )
-        end)
-    end
-
-    android.booxSetDrawingMode = function(enabled, excludeRectsJson)
-        JNI:context(android.app.activity.vm, function(jni)
-            local json_str = jni.env[0].NewStringUTF(jni.env, excludeRectsJson or "[]")
-            jni:callVoidMethod(
-                android.app.activity.clazz,
-                "booxSetDrawingMode",
-                "(ZLjava/lang/String;)V",
-                ffi.new("bool", enabled),
-                json_str
-            )
-        end)
-    end
-
-    android.booxSetPenWidth = function(width)
-        JNI:context(android.app.activity.vm, function(jni)
-            jni:callVoidMethod(
-                android.app.activity.clazz,
-                "booxSetPenWidth",
-                "(F)V",
-                ffi.new("float", width)
-            )
-        end)
-    end
-
-    android.booxSetPenColor = function(color)
-        JNI:context(android.app.activity.vm, function(jni)
-            jni:callVoidMethod(
-                android.app.activity.clazz,
-                "booxSetPenColor",
-                "(I)V",
-                ffi.new("int32_t", color)
-            )
-        end)
-    end
-
-    android.booxPollStrokes = function()
-        return JNI:context(android.app.activity.vm, function(jni)
-            local res = jni:callObjectMethod(
-                android.app.activity.clazz,
-                "booxPollStrokes",
-                "()Ljava/lang/String;"
-            )
-            return jni:to_string(res)
-        end)
-    end
-
-    android.booxClearStrokes = function()
-        JNI:context(android.app.activity.vm, function(jni)
-            jni:callVoidMethod(
-                android.app.activity.clazz,
-                "booxClearStrokes",
                 "()V"
             )
         end)

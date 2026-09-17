@@ -2,6 +2,7 @@
 output/
 temp_apk_extract/
 *.apk
+*.zip
 
 # Gradle and Android build files
 .gradle/

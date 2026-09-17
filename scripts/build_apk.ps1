@@ -22,10 +22,28 @@ Write-Host "Building KOReader with Onyx Boox Stylus Support" -ForegroundColor Cy
 Write-Host "Build Type: $BuildType (Architecture: ARM64-v8a)" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
-# Check for Android SDK
-if (-not $env:ANDROID_HOME -and -not $env:ANDROID_SDK_ROOT) {
-    Write-Warning "Neither ANDROID_HOME nor ANDROID_SDK_ROOT environment variable is set."
-    Write-Host "Ensure Android SDK is installed or configure local.properties in android-launcher." -ForegroundColor Yellow
+# Auto-detect Android SDK
+$SdkCandidates = @(
+    "$env:LOCALAPPDATA\Android\Sdk",
+    $env:ANDROID_HOME,
+    $env:ANDROID_SDK_ROOT,
+    "C:\Program Files (x86)\Android\android-sdk",
+    "C:\Program Files\Android\android-sdk"
+)
+
+$FoundSdk = $SdkCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+
+if ($FoundSdk) {
+    $env:ANDROID_HOME = $FoundSdk
+    $env:ANDROID_SDK_ROOT = $FoundSdk
+    Write-Host "[*] Using Android SDK at: $FoundSdk" -ForegroundColor Green
+    
+    $LocalProps = Join-Path $LauncherDir "local.properties"
+    $EscapedSdk = $FoundSdk -replace '\\', '\\'
+    Set-Content -Path $LocalProps -Value "sdk.dir=$EscapedSdk" -Force
+} else {
+    Write-Warning "Android SDK could not be located automatically."
+    Write-Host "Please set ANDROID_HOME or configure android-launcher\local.properties." -ForegroundColor Yellow
 }
 
 # Ensure output directory exists
@@ -35,12 +53,14 @@ if (-not (Test-Path $OutputDir)) {
 
 Push-Location $LauncherDir
 try {
-    $GradleCommand = if ($IsWindows -or $env:OS -like "*Windows*") { ".\gradlew.bat" } else { "./gradlew" }
-    
-    $TaskName = "assembleArm64$BuildType"
+    $TaskName = "assembleArm64Rocks$BuildType"
     Write-Host "[*] Executing Gradle task: $TaskName..." -ForegroundColor Yellow
     
-    & $GradleCommand $TaskName --stacktrace
+    if (Test-Path ".\gradlew.bat") {
+        .\gradlew.bat $TaskName --stacktrace
+    } else {
+        java -cp "gradle\wrapper\gradle-wrapper.jar" org.gradle.wrapper.GradleWrapperMain $TaskName --stacktrace
+    }
 
     # Locate generated APK
     $ApkPath = Get-ChildItem -Path "app\build\outputs\apk" -Filter "*.apk" -Recurse | 

@@ -14,7 +14,7 @@ import android.view.View
 import android.view.ViewGroup
 import com.onyx.android.sdk.pen.RawInputCallback
 import com.onyx.android.sdk.pen.TouchHelper
-import com.onyx.android.sdk.pen.data.TouchPoint
+import com.onyx.android.sdk.data.note.TouchPoint
 import com.onyx.android.sdk.pen.data.TouchPointList
 import org.json.JSONArray
 import org.json.JSONObject
@@ -128,7 +128,7 @@ object OnyxPenBridge {
 
                 override fun onRawDrawingTouchPointListReceived(pointList: TouchPointList) {
                     synchronized(strokeLock) {
-                        val pts = pointList.touchPoints
+                        val pts = pointList.points
                         if (pts != null) {
                             for (p in pts) {
                                 addPoint(p)

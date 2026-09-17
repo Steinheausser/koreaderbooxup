@@ -32,7 +32,8 @@
         android:fullBackupContent="false"
         android:usesCleartextTraffic="true"
         android:requestLegacyExternalStorage="true"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        tools:replace="android:allowBackup,android:label">
         <meta-data android:name="android.max_aspect" android:value="3.1" />
         <activity
             android:name=".MainActivity"

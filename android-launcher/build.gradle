@@ -1,7 +1,7 @@
 buildscript {
-    ext.compileSdk = 30
-    ext.targetSdk = 30
-    ext.minSdk = 18
+    ext.compileSdk = 34
+    ext.targetSdk = 34
+    ext.minSdk = 26
 
     ext.gradle_plugin_version = '8.4.2'
     ext.kotlin_plugin_version = '1.9.24'

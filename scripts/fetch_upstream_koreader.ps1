@@ -27,25 +27,32 @@ Write-Host "====================================================" -ForegroundCol
 Write-Host "KOReader Upstream Asset & Library Ingestion" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
-if (-not (Test-Path $ApkPath)) {
-    Write-Host "[*] Querying GitHub for latest official KOReader Android ARM64 release..." -ForegroundColor Yellow
-    $ApiUrl = "https://api.github.com/repos/koreader/koreader/releases/latest"
-    $Headers = @{ "User-Agent" = "KOReader-Boox-Ingestor" }
-    
-    try {
-        $Release = Invoke-RestMethod -Uri $ApiUrl -Headers $Headers
-        $Asset = $Release.assets | Where-Object { $_.name -like "koreader-android-arm64-*.apk" } | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($ApkPath) -or -not (Test-Path $ApkPath)) {
+    # Check if a previously downloaded APK exists in Root
+    $ExistingApk = Get-ChildItem -Path $Root -Filter "koreader-android-arm64-*.apk" | Select-Object -First 1
+    if ($ExistingApk) {
+        $ApkPath = $ExistingApk.FullName
+        Write-Host "[*] Found existing local APK: $($ExistingApk.Name)" -ForegroundColor Green
+    } else {
+        Write-Host "[*] Querying GitHub for latest official KOReader Android ARM64 release..." -ForegroundColor Yellow
+        $ApiUrl = "https://api.github.com/repos/koreader/koreader/releases/latest"
+        $Headers = @{ "User-Agent" = "KOReader-Boox-Ingestor" }
         
-        if (-not $Asset) {
-            throw "Could not find koreader-android-arm64-*.apk in latest release assets."
-        }
+        try {
+            $Release = Invoke-RestMethod -Uri $ApiUrl -Headers $Headers
+            $Asset = $Release.assets | Where-Object { $_.name -like "koreader-android-arm64-*.apk" } | Select-Object -First 1
+            
+            if (-not $Asset) {
+                throw "Could not find koreader-android-arm64-*.apk in latest release assets."
+            }
 
-        $ApkPath = Join-Path $Root $Asset.name
-        Write-Host "[*] Downloading $($Asset.name) ($([math]::Round($Asset.size / 1MB, 2)) MB)..." -ForegroundColor Green
-        Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ApkPath
-    } catch {
-        Write-Error "Failed to fetch release from GitHub: $_"
-        exit 1
+            $ApkPath = Join-Path $Root $Asset.name
+            Write-Host "[*] Downloading $($Asset.name) ($([math]::Round($Asset.size / 1MB, 2)) MB)..." -ForegroundColor Green
+            Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ApkPath
+        } catch {
+            Write-Error "Failed to fetch release from GitHub: $_"
+            exit 1
+        }
     }
 } else {
     Write-Host "[*] Using provided APK: $ApkPath" -ForegroundColor Green
@@ -58,7 +65,10 @@ if (Test-Path $TempDir) {
 New-Item -ItemType Directory -Path $TempDir | Out-Null
 
 Write-Host "[*] Extracting APK archive..." -ForegroundColor Yellow
-Expand-Archive -Path $ApkPath -DestinationPath $TempDir -Force
+$TempZip = Join-Path $Root "temp_extract.zip"
+Copy-Item -Path $ApkPath -Destination $TempZip -Force
+Expand-Archive -Path $TempZip -DestinationPath $TempDir -Force
+Remove-Item -Force $TempZip
 
 # 1. Populate Assets
 Write-Host "[*] Updating launcher assets..." -ForegroundColor Yellow
