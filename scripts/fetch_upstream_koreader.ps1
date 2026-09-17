@@ -80,6 +80,87 @@ if (Test-Path "$TempDir\assets") {
     Copy-Item -Recurse -Force "$TempDir\assets\*" $AssetsDir
 }
 
+# 1b. Ensure Onyx Boox low-latency stylus bindings exist in android.lua
+$AndroidLua = Join-Path $AssetsDir "android.lua"
+if (Test-Path $AndroidLua) {
+    $Content = [System.IO.File]::ReadAllText($AndroidLua)
+    if (-not $Content.Contains("booxIsSupported")) {
+        Write-Host "[*] Injecting Boox stylus JNI bindings into android.lua..." -ForegroundColor Yellow
+        $BooxBridgeCode = @'
+    -- Onyx Boox low-latency stylus bridge
+    android.booxIsSupported = function()
+        return JNI:context(android.app.activity.vm, function(jni)
+            return jni:callBooleanMethod(
+                android.app.activity.clazz,
+                "booxIsSupported",
+                "()Z"
+            )
+        end)
+    end
+
+    android.booxSetDrawingMode = function(enabled, excludeRectsJson)
+        JNI:context(android.app.activity.vm, function(jni)
+            local json_str = jni.env[0].NewStringUTF(jni.env, excludeRectsJson or "[]")
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxSetDrawingMode",
+                "(ZLjava/lang/String;)V",
+                ffi.new("bool", enabled),
+                json_str
+            )
+            jni.env[0].DeleteLocalRef(jni.env, json_str)
+        end)
+    end
+
+    android.booxSetPenWidth = function(width)
+        JNI:context(android.app.activity.vm, function(jni)
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxSetPenWidth",
+                "(F)V",
+                ffi.new("float", width)
+            )
+        end)
+    end
+
+    android.booxSetPenColor = function(color)
+        JNI:context(android.app.activity.vm, function(jni)
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxSetPenColor",
+                "(I)V",
+                ffi.new("int32_t", color)
+            )
+        end)
+    end
+
+    android.booxPollStrokes = function()
+        return JNI:context(android.app.activity.vm, function(jni)
+            local res = jni:callObjectMethod(
+                android.app.activity.clazz,
+                "booxPollStrokes",
+                "()Ljava/lang/String;"
+            )
+            return jni:to_string(res)
+        end)
+    end
+
+    android.booxClearStrokes = function()
+        JNI:context(android.app.activity.vm, function(jni)
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxClearStrokes",
+                "()V"
+            )
+        end)
+    end
+
+'@
+        $Content = $Content.Replace("android.canWriteSettings = function()", "$BooxBridgeCode`n    android.canWriteSettings = function()")
+        [System.IO.File]::WriteAllText($AndroidLua, $Content)
+    }
+}
+
 # 2. Bundle the Boox Pen Plugin into assets/plugins
 $PluginSrc = Join-Path $Root "plugins\boox_pen.koplugin"
 $PluginDst = Join-Path $AssetsDir "plugins\boox_pen.koplugin"

@@ -50,6 +50,8 @@ object OnyxPenBridge {
         return Build.MANUFACTURER.equals("onyx", ignoreCase = true)
     }
 
+    private var lastExcludeRectsJson: String? = null
+
     /**
      * Initializes the transparent overlay SurfaceView on the Activity.
      */
@@ -77,6 +79,9 @@ object OnyxPenBridge {
                 surface.holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) {
                         initTouchHelper(surface)
+                        if (isDrawingActive) {
+                            applyRawDrawingState(activity, surface, true, lastExcludeRectsJson)
+                        }
                     }
                     override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {}
                     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -175,55 +180,66 @@ object OnyxPenBridge {
                 }
 
                 val surface = overlaySurface ?: return@post
-                val helper = touchHelper
 
                 if (enabled) {
+                    isDrawingActive = true
+                    lastExcludeRectsJson = excludeRectsJson
                     surface.visibility = View.VISIBLE
                     surface.bringToFront()
 
-                    helper?.let { th ->
-                        th.setStrokeWidth(currentStrokeWidth)
-                        th.setStrokeColor(currentStrokeColor)
-
-                        // Parse and set limit exclusion rectangles if provided
-                        if (!excludeRectsJson.isNullOrEmpty()) {
-                            try {
-                                val jsonArr = JSONArray(excludeRectsJson)
-                                val excludeList = mutableListOf<Rect>()
-                                for (i in 0 until jsonArr.length()) {
-                                    val item = jsonArr.getJSONObject(i)
-                                    val x = item.getInt("x")
-                                    val y = item.getInt("y")
-                                    val w = item.getInt("w")
-                                    val h = item.getInt("h")
-                                    excludeList.add(Rect(x, y, x + w, y + h))
-                                }
-                                val screenRect = Rect(0, 0, surface.width, surface.height)
-                                th.setLimitRect(listOf(screenRect), excludeList)
-                            } catch (e: Exception) {
-                                Log.w(TAG, "Failed parsing exclude rects", e)
-                            }
-                        }
-
-                        th.openRawDrawing()
-                        th.setRawDrawingEnabled(true)
-                        th.setRawDrawingRenderEnabled(true)
+                    if (touchHelper != null) {
+                        applyRawDrawingState(activity, surface, true, excludeRectsJson)
                     }
-                    isDrawingActive = true
-                    Log.i(TAG, "Drawing mode ENABLED")
                 } else {
-                    helper?.let { th ->
-                        th.setRawDrawingRenderEnabled(false)
-                        th.setRawDrawingEnabled(false)
-                        th.closeRawDrawing()
-                    }
-                    surface.visibility = View.GONE
                     isDrawingActive = false
-                    Log.i(TAG, "Drawing mode DISABLED")
+                    lastExcludeRectsJson = null
+                    applyRawDrawingState(activity, surface, false, null)
+                    surface.visibility = View.GONE
                 }
             } catch (e: Throwable) {
                 Log.e(TAG, "Error setting drawing mode", e)
             }
+        }
+    }
+
+    private fun applyRawDrawingState(activity: Activity, surface: SurfaceView, enabled: Boolean, excludeRectsJson: String?) {
+        val helper = touchHelper ?: return
+        if (enabled) {
+            helper.setStrokeWidth(currentStrokeWidth)
+            helper.setStrokeColor(currentStrokeColor)
+
+            val displayMetrics = activity.resources.displayMetrics
+            val screenW = if (surface.width > 0) surface.width else displayMetrics.widthPixels
+            val screenH = if (surface.height > 0) surface.height else displayMetrics.heightPixels
+            val screenRect = Rect(0, 0, screenW, screenH)
+
+            val excludeList = mutableListOf<Rect>()
+            if (!excludeRectsJson.isNullOrEmpty()) {
+                try {
+                    val jsonArr = JSONArray(excludeRectsJson)
+                    for (i in 0 until jsonArr.length()) {
+                        val item = jsonArr.getJSONObject(i)
+                        val x = item.getInt("x")
+                        val y = item.getInt("y")
+                        val w = item.getInt("w")
+                        val h = item.getInt("h")
+                        excludeList.add(Rect(x, y, x + w, y + h))
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed parsing exclude rects", e)
+                }
+            }
+
+            helper.setLimitRect(listOf(screenRect), excludeList)
+            helper.openRawDrawing()
+            helper.setRawDrawingEnabled(true)
+            helper.setRawDrawingRenderEnabled(true)
+            Log.i(TAG, "Raw drawing ENABLED on SurfaceView: screen ${screenW}x${screenH}, ${excludeList.size} exclusion zones")
+        } else {
+            helper.setRawDrawingRenderEnabled(false)
+            helper.setRawDrawingEnabled(false)
+            helper.closeRawDrawing()
+            Log.i(TAG, "Raw drawing DISABLED on SurfaceView")
         }
     }
 

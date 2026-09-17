@@ -22,15 +22,65 @@ class Assets {
     }
 
     fun extract(activity: Activity): Boolean {
+        // Always ensure bundled plugins (such as boox_pen.koplugin) are copied
+        // to both internal app storage and shared /sdcard/koreader/plugins
+        extractBundledPlugins(activity)
+
         return if (isNewBundle(activity)) {
             val startTime = System.nanoTime()
             val result = bootstrap(activity)
             val elapsedTime = System.nanoTime() - startTime
             Log.i(tag, "update installed in ${elapsedTime / 1000000} milliseconds")
             activity.pruneCacheDir()
+            extractBundledPlugins(activity)
             result
         } else {
             true
+        }
+    }
+
+    private fun extractBundledPlugins(activity: Activity) {
+        try {
+            val internalPlugins = File(activity.filesDir, "plugins")
+            copyAssetFolder(activity.assets, "plugins", internalPlugins.absolutePath)
+
+            val sharedPlugins = File(MainApp.storage_path, "koreader/plugins")
+            if (sharedPlugins.exists() || sharedPlugins.mkdirs()) {
+                copyAssetFolder(activity.assets, "plugins", sharedPlugins.absolutePath)
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "Error extracting bundled plugins", e)
+        }
+    }
+
+    private fun copyAssetFolder(assetManager: AssetManager, fromAssetPath: String, toPath: String): Boolean {
+        return try {
+            val files = assetManager.list(fromAssetPath) ?: return false
+            val toDir = File(toPath)
+            if (!toDir.exists()) toDir.mkdirs()
+            var res = true
+            for (file in files) {
+                val fromSubPath = if (fromAssetPath.isEmpty()) file else "$fromAssetPath/$file"
+                val toSubPath = "$toPath/$file"
+                val subFiles = assetManager.list(fromSubPath)
+                if (subFiles != null && subFiles.isNotEmpty()) {
+                    res = res and copyAssetFolder(assetManager, fromSubPath, toSubPath)
+                } else {
+                    try {
+                        assetManager.open(fromSubPath).use { input ->
+                            FileOutputStream(File(toSubPath)).use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // Might be empty directory
+                    }
+                }
+            }
+            res
+        } catch (e: Exception) {
+            Log.e(tag, "Failed copying asset folder: $fromAssetPath", e)
+            false
         }
     }
 

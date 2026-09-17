@@ -23,6 +23,7 @@ local BooxPen = WidgetContainer:extend{
 
 function BooxPen:init()
     self.ui.menu:registerToMainMenu(self)
+    self.auto_enable_drawing = G_reader_settings:isTrue("boox_pen_auto_enable")
 end
 
 function BooxPen:onReaderReady()
@@ -42,6 +43,12 @@ function BooxPen:onReaderReady()
         end
         self.patched_view = reader_view
         logger.info("BooxPen: successfully hooked into ReaderView:paintTo")
+    end
+
+    if self.auto_enable_drawing then
+        UIManager:scheduleIn(0.5, function()
+            self:setDrawingMode(true)
+        end)
     end
 end
 
@@ -214,12 +221,21 @@ end
 function BooxPen:addToMainMenu(menu_items)
     menu_items.boox_pen = {
         text = _("Boox Stylus Annotations"),
+        sorting_hint = "tools",
         sub_item_table = {
             {
                 text = _("Enable Stylus Inking"),
                 checked_func = function() return self.is_drawing_active end,
                 callback = function()
                     self:setDrawingMode(not self.is_drawing_active)
+                end,
+            },
+            {
+                text = _("Auto-enable on document open"),
+                checked_func = function() return self.auto_enable_drawing end,
+                callback = function()
+                    self.auto_enable_drawing = not self.auto_enable_drawing
+                    G_reader_settings:saveSetting("boox_pen_auto_enable", self.auto_enable_drawing)
                 end,
             },
             {

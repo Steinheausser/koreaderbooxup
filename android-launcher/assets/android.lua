@@ -2389,6 +2389,74 @@ local function run(android_app_state)
         end)
     end
 
+    -- Onyx Boox low-latency stylus bridge
+    android.booxIsSupported = function()
+        return JNI:context(android.app.activity.vm, function(jni)
+            return jni:callBooleanMethod(
+                android.app.activity.clazz,
+                "booxIsSupported",
+                "()Z"
+            )
+        end)
+    end
+
+    android.booxSetDrawingMode = function(enabled, excludeRectsJson)
+        JNI:context(android.app.activity.vm, function(jni)
+            local json_str = jni.env[0].NewStringUTF(jni.env, excludeRectsJson or "[]")
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxSetDrawingMode",
+                "(ZLjava/lang/String;)V",
+                ffi.new("bool", enabled),
+                json_str
+            )
+            jni.env[0].DeleteLocalRef(jni.env, json_str)
+        end)
+    end
+
+    android.booxSetPenWidth = function(width)
+        JNI:context(android.app.activity.vm, function(jni)
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxSetPenWidth",
+                "(F)V",
+                ffi.new("float", width)
+            )
+        end)
+    end
+
+    android.booxSetPenColor = function(color)
+        JNI:context(android.app.activity.vm, function(jni)
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxSetPenColor",
+                "(I)V",
+                ffi.new("int32_t", color)
+            )
+        end)
+    end
+
+    android.booxPollStrokes = function()
+        return JNI:context(android.app.activity.vm, function(jni)
+            local res = jni:callObjectMethod(
+                android.app.activity.clazz,
+                "booxPollStrokes",
+                "()Ljava/lang/String;"
+            )
+            return jni:to_string(res)
+        end)
+    end
+
+    android.booxClearStrokes = function()
+        JNI:context(android.app.activity.vm, function(jni)
+            jni:callVoidMethod(
+                android.app.activity.clazz,
+                "booxClearStrokes",
+                "()V"
+            )
+        end)
+    end
+
     --- Android permission check.
     -- @treturn bool hasWriteSettingsPermission
     android.canWriteSettings = function()
