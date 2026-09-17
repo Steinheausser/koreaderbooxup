@@ -17,6 +17,7 @@ import android.os.*
 import android.provider.Settings
 import android.util.Log
 import android.view.*
+import android.view.MotionEvent
 import android.widget.Toast
 import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
@@ -167,6 +168,25 @@ class MainActivity : NativeActivity(), LuaInterface,
         OnyxPenBridge.onPause()
         isResumed = false
         intent = null
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (OnyxPenBridge.isDrawingActive()) {
+            val toolType = ev.getToolType(0)
+            if (toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER) {
+                // If tapped in the top menu bar (top 120px) or bottom status bar (bottom 120px),
+                // allow the event through so the user can interact with menus.
+                val y = ev.y
+                val height = resources.displayMetrics.heightPixels
+                if (y < 120f || y > (height - 120f)) {
+                    return super.dispatchTouchEvent(ev)
+                }
+                // Otherwise consume stylus input so NativeActivity / KOReader's
+                // AInputQueue does not interpret pen strokes as swipe gestures or page turns.
+                return true
+            }
+        }
+        return super.dispatchTouchEvent(ev)
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {

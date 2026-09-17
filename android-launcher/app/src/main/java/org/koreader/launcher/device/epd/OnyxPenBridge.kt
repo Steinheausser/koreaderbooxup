@@ -51,6 +51,8 @@ object OnyxPenBridge {
                Build.FINGERPRINT.contains("onyx", ignoreCase = true)
     }
 
+    fun isDrawingActive(): Boolean = isDrawingActive
+
     /**
      * Initializes the TouchHelper directly on the Activity window decorView.
      */
@@ -67,6 +69,8 @@ object OnyxPenBridge {
                         Log.d(TAG, "onBeginRawDrawing at (${point.x}, ${point.y}, p=${point.pressure})")
                         synchronized(strokeLock) {
                             activePoints.clear()
+                            lastAddedX = -1f
+                            lastAddedY = -1f
                             addPoint(point)
                         }
                     }
@@ -75,7 +79,7 @@ object OnyxPenBridge {
                         Log.d(TAG, "onEndRawDrawing at (${point.x}, ${point.y}), points: ${activePoints.size}")
                         synchronized(strokeLock) {
                             addPoint(point)
-                            if (activePoints.isNotEmpty()) {
+                            if (activePoints.size >= 2) {
                                 val strokeObj = JSONObject().apply {
                                     put("width", currentStrokeWidth.toDouble())
                                     put("color", currentStrokeColor)
@@ -87,8 +91,10 @@ object OnyxPenBridge {
                                 }
                                 pendingStrokes.add(strokeObj.toString())
                                 Log.i(TAG, "Stroke queued: ${activePoints.size} points")
-                                activePoints.clear()
                             }
+                            activePoints.clear()
+                            lastAddedX = -1f
+                            lastAddedY = -1f
                         }
                     }
 
@@ -119,6 +125,8 @@ object OnyxPenBridge {
                 touchHelper = TouchHelper.create(hostView, true, callback).apply {
                     setStrokeWidth(currentStrokeWidth)
                     setStrokeColor(currentStrokeColor)
+                    setPostInputEvent(false)
+                    setPenUpRefreshEnabled(false)
                     debugLog(true)
                 }
                 Log.i(TAG, "TouchHelper created and bound to decorView successfully")
@@ -128,12 +136,35 @@ object OnyxPenBridge {
         }
     }
 
+    private var lastAddedX = -1f
+    private var lastAddedY = -1f
+
     private fun addPoint(point: TouchPoint) {
         try {
+            val dx = point.x - lastAddedX
+            val dy = point.y - lastAddedY
+            // Downsample: skip redundant points within 3.0px distance to prevent point explosion
+            if (lastAddedX >= 0f && (dx * dx + dy * dy) < 9.0f) {
+                return
+            }
+            lastAddedX = point.x
+            lastAddedY = point.y
+
+            // Normalize pressure: Wacom on Onyx reports 0..4096.
+            // Map to ~0.3 .. 1.8 so stroke width multiplier is sane and never stalls rendering.
+            val rawP = point.pressure
+            val normP = if (rawP > 2.0f) {
+                (rawP / 2048.0f).coerceIn(0.3f, 1.8f)
+            } else if (rawP > 0.0f) {
+                rawP.coerceIn(0.3f, 1.8f)
+            } else {
+                1.0f
+            }
+
             val pt = JSONObject().apply {
-                put("x", point.x.toDouble())
-                put("y", point.y.toDouble())
-                put("p", point.pressure.toDouble())
+                put("x", Math.round(point.x * 10.0) / 10.0)
+                put("y", Math.round(point.y * 10.0) / 10.0)
+                put("p", Math.round(normP * 100.0) / 100.0)
             }
             activePoints.add(pt)
         } catch (e: Exception) {
@@ -187,6 +218,8 @@ object OnyxPenBridge {
                     helper.openRawDrawing()
                     helper.setRawDrawingEnabled(true)
                     helper.setRawDrawingRenderEnabled(true)
+                    helper.setPostInputEvent(false)
+                    helper.setPenUpRefreshEnabled(false)
                     isDrawingActive = true
                     Log.i(TAG, "OnyxPenBridge: Drawing mode ENABLED on decorView (${screenW}x${screenH}, ${excludeList.size} exclusion zones)")
                 } else {

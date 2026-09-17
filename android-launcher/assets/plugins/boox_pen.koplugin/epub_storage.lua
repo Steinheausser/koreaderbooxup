@@ -1,3 +1,4 @@
+local JSON = require("json")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 
@@ -44,49 +45,29 @@ function EpubStorage:load()
     local content = f:read("*all")
     f:close()
 
-    local chunk, err = loadstring(content)
-    if chunk then
-        local success, result = pcall(chunk)
-        if success and type(result) == "table" then
-            self.data = result
-            if not self.data.pages then self.data.pages = {} end
-            logger.info("BooxPen: loaded annotations from " .. self.file_path)
-            return
+    if not content or content == "" then
+        self.data = { version = 1, pages = {} }
+        return
+    end
+
+    local success, result = pcall(JSON.decode, content)
+    if not success or type(result) ~= "table" then
+        local chunk = loadstring(content)
+        if chunk then
+            local ok, res = pcall(chunk)
+            if ok and type(res) == "table" then
+                result = res
+                success = true
+            end
         end
     end
-    logger.warn("BooxPen: could not parse annotations file: " .. tostring(err))
-    self.data = { version = 1, pages = {} }
-end
 
--- Compact Lua table serialization
-local function serializeTable(val, name, indent)
-    indent = indent or ""
-    local t = type(val)
-    if t == "number" then
-        return tostring(val)
-    elseif t == "boolean" then
-        return tostring(val)
-    elseif t == "string" then
-        return string.format("%q", val)
-    elseif t == "table" then
-        local parts = { "{\n" }
-        local next_indent = indent .. "  "
-        -- Array part
-        local is_array = #val > 0
-        if is_array then
-            for i, v in ipairs(val) do
-                table.insert(parts, next_indent .. serializeTable(v, nil, next_indent) .. ",\n")
-            end
-        else
-            for k, v in pairs(val) do
-                local key_str = type(k) == "number" and "[" .. k .. "]" or string.format("[%q]", tostring(k))
-                table.insert(parts, next_indent .. key_str .. " = " .. serializeTable(v, nil, next_indent) .. ",\n")
-            end
-        end
-        table.insert(parts, indent .. "}")
-        return table.concat(parts)
+    if success and type(result) == "table" then
+        self.data = result
+        if not self.data.pages then self.data.pages = {} end
+        logger.info("BooxPen: loaded annotations from " .. self.file_path)
     else
-        return "nil"
+        self.data = { version = 1, pages = {} }
     end
 end
 
@@ -98,7 +79,10 @@ function EpubStorage:save()
         return false
     end
 
-    f:write("return " .. serializeTable(self.data) .. "\n")
+    local ok, encoded = pcall(JSON.encode, self.data)
+    if ok and encoded then
+        f:write(encoded .. "\n")
+    end
     f:close()
     return true
 end

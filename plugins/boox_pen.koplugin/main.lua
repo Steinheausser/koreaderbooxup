@@ -70,7 +70,7 @@ function BooxPen:onReaderReady()
 end
 
 function BooxPen:onCloseDocument()
-    self:setDrawingMode(false)
+    self:setDrawingMode(false, true)
     if self.storage then
         self.storage:save()
         self.storage = nil
@@ -113,7 +113,7 @@ function BooxPen:isSupported()
     return false
 end
 
-function BooxPen:setDrawingMode(enable)
+function BooxPen:setDrawingMode(enable, silent)
     if self.is_drawing_active == enable then return end
     self.is_drawing_active = enable
 
@@ -122,29 +122,33 @@ function BooxPen:setDrawingMode(enable)
         if enable then
             local screen_w = Screen:getWidth()
             local screen_h = Screen:getHeight()
-            -- Exclude top menu bar (top 100px) and bottom status bar (bottom 100px)
+            -- Exclude top menu bar (top 120px) and bottom status bar (bottom 120px)
             local exclude_rects = {
-                { x = 0, y = 0, w = screen_w, h = 100 },
-                { x = 0, y = screen_h - 100, w = screen_w, h = 100 }
+                { x = 0, y = 0, w = screen_w, h = 120 },
+                { x = 0, y = screen_h - 120, w = screen_w, h = 120 }
             }
             local exclude_json = JSON.encode(exclude_rects)
             a.booxSetDrawingMode(true, exclude_json)
             a.booxSetPenWidth(self.pen_width)
             a.booxSetPenColor(self.pen_color)
             self:startPolling()
-            UIManager:show(require("ui/widget/notification"):new{
-                text = _("Stylus Drawing Active (Write with Pen)"),
-                timeout = 1.5,
-            })
+            if not silent then
+                UIManager:show(require("ui/widget/notification"):new{
+                    text = _("Stylus Drawing Active (Write with Pen)"),
+                    timeout = 1.5,
+                })
+            end
         else
             self:stopPolling()
             -- Drain remaining strokes before disabling
             self:pollStrokes()
             a.booxSetDrawingMode(false, "[]")
-            UIManager:show(require("ui/widget/notification"):new{
-                text = _("Stylus Drawing Deactivated"),
-                timeout = 1.5,
-            })
+            if not silent then
+                UIManager:show(require("ui/widget/notification"):new{
+                    text = _("Stylus Drawing Deactivated"),
+                    timeout = 1.5,
+                })
+            end
         end
     else
         logger.warn("BooxPen: android.booxSetDrawingMode not available on this build/platform")

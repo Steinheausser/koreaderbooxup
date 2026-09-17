@@ -45,7 +45,7 @@ function Renderer.renderStroke(bb, stroke, screen_w, screen_h)
         local pt = points[1]
         local px = math.floor(pt.x * screen_w)
         local py = math.floor(pt.y * screen_h)
-        local w = math.max(1, math.floor(base_width * (pt.p or 1.0)))
+        local w = math.min(16, math.max(1, math.floor(base_width * (pt.p or 1.0))))
         local r = math.floor(w / 2)
         bb:paintRect(px - r, py - r, w, w, stroke_color)
         return
@@ -60,7 +60,7 @@ function Renderer.renderStroke(bb, stroke, screen_w, screen_h)
         local y1 = math.floor(p1.y * screen_h)
 
         local avg_p = ((p0.p or 1.0) + (p1.p or 1.0)) / 2
-        local dynamic_w = math.max(1, math.floor(base_width * avg_p))
+        local dynamic_w = math.min(16, math.max(1, math.floor(base_width * avg_p)))
 
         Renderer.drawLine(bb, x0, y0, x1, y1, dynamic_w, stroke_color)
     end
