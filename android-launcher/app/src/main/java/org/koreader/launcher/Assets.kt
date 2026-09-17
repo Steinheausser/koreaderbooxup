@@ -67,11 +67,14 @@ class Assets {
                     res = res and copyAssetFolder(assetManager, fromSubPath, toSubPath)
                 } else {
                     try {
+                        val targetFile = File(toSubPath)
+                        targetFile.parentFile?.mkdirs()
                         assetManager.open(fromSubPath).use { input ->
-                            FileOutputStream(File(toSubPath)).use { output ->
+                            FileOutputStream(targetFile).use { output ->
                                 input.copyTo(output)
                             }
                         }
+                        Log.i(tag, "Extracted plugin file: $fromSubPath -> $toSubPath")
                     } catch (e: Exception) {
                         // Might be empty directory
                     }

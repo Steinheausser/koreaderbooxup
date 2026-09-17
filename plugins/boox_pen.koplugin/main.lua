@@ -9,6 +9,18 @@ local logger = require("logger")
 local EpubStorage = require("epub_storage")
 local Renderer = require("renderer")
 
+local function getAndroid()
+    local ok, mod = pcall(require, "android")
+    if ok and mod then
+        return mod
+    elseif package.loaded.android then
+        return package.loaded.android
+    elseif _G.android then
+        return _G.android
+    end
+    return nil
+end
+
 local BooxPen = WidgetContainer:extend{
     name = "boox_pen",
     is_drawing_active = false,
@@ -23,7 +35,12 @@ local BooxPen = WidgetContainer:extend{
 
 function BooxPen:init()
     self.ui.menu:registerToMainMenu(self)
-    self.auto_enable_drawing = G_reader_settings:isTrue("boox_pen_auto_enable")
+    local auto_enable = G_reader_settings:readSetting("boox_pen_auto_enable")
+    if auto_enable == nil then
+        self.auto_enable_drawing = true
+    else
+        self.auto_enable_drawing = (auto_enable == true)
+    end
 end
 
 function BooxPen:onReaderReady()
@@ -89,9 +106,9 @@ end
 
 -- Check if device supports Boox low-latency pen
 function BooxPen:isSupported()
-    local android = _G.android
-    if android and android.booxIsSupported then
-        return android.booxIsSupported()
+    local a = getAndroid()
+    if a and a.booxIsSupported then
+        return a.booxIsSupported()
     end
     return false
 end
@@ -100,30 +117,30 @@ function BooxPen:setDrawingMode(enable)
     if self.is_drawing_active == enable then return end
     self.is_drawing_active = enable
 
-    local android = _G.android
-    if android and android.booxSetDrawingMode then
+    local a = getAndroid()
+    if a and a.booxSetDrawingMode then
         if enable then
             local screen_w = Screen:getWidth()
             local screen_h = Screen:getHeight()
-            -- Exclude top menu bar (top 80px) and bottom status bar (bottom 80px)
+            -- Exclude top menu bar (top 100px) and bottom status bar (bottom 100px)
             local exclude_rects = {
-                { x = 0, y = 0, w = screen_w, h = 80 },
-                { x = 0, y = screen_h - 80, w = screen_w, h = 80 }
+                { x = 0, y = 0, w = screen_w, h = 100 },
+                { x = 0, y = screen_h - 100, w = screen_w, h = 100 }
             }
             local exclude_json = JSON.encode(exclude_rects)
-            android.booxSetDrawingMode(true, exclude_json)
-            android.booxSetPenWidth(self.pen_width)
-            android.booxSetPenColor(self.pen_color)
+            a.booxSetDrawingMode(true, exclude_json)
+            a.booxSetPenWidth(self.pen_width)
+            a.booxSetPenColor(self.pen_color)
             self:startPolling()
             UIManager:show(require("ui/widget/notification"):new{
-                text = _("Stylus Drawing Active (Hardware EPD Mode)"),
+                text = _("Stylus Drawing Active (Write with Pen)"),
                 timeout = 1.5,
             })
         else
             self:stopPolling()
             -- Drain remaining strokes before disabling
             self:pollStrokes()
-            android.booxSetDrawingMode(false, "[]")
+            a.booxSetDrawingMode(false, "[]")
             UIManager:show(require("ui/widget/notification"):new{
                 text = _("Stylus Drawing Deactivated"),
                 timeout = 1.5,
@@ -159,10 +176,10 @@ function BooxPen:stopPolling()
 end
 
 function BooxPen:pollStrokes()
-    local android = _G.android
-    if not android or not android.booxPollStrokes or not self.storage then return end
+    local a = getAndroid()
+    if not a or not a.booxPollStrokes or not self.storage then return end
 
-    local json_str = android.booxPollStrokes()
+    local json_str = a.booxPollStrokes()
     if not json_str or json_str == "" or json_str == "[]" then return end
 
     local success, strokes = pcall(JSON.decode, json_str)
@@ -261,10 +278,10 @@ function BooxPen:addToMainMenu(menu_items)
             {
                 text = _("Pen Width"),
                 sub_item_table = {
-                    { text = _("Fine (1px)"), checked_func = function() return self.pen_width == 1 end, callback = function() self.pen_width = 1 if _G.android then _G.android.booxSetPenWidth(1) end end },
-                    { text = _("Medium (3px)"), checked_func = function() return self.pen_width == 3 end, callback = function() self.pen_width = 3 if _G.android then _G.android.booxSetPenWidth(3) end end },
-                    { text = _("Bold (5px)"), checked_func = function() return self.pen_width == 5 end, callback = function() self.pen_width = 5 if _G.android then _G.android.booxSetPenWidth(5) end end },
-                    { text = _("Heavy (8px)"), checked_func = function() return self.pen_width == 8 end, callback = function() self.pen_width = 8 if _G.android then _G.android.booxSetPenWidth(8) end end },
+                    { text = _("Fine (1px)"), checked_func = function() return self.pen_width == 1 end, callback = function() self.pen_width = 1 local a = getAndroid() if a and a.booxSetPenWidth then a.booxSetPenWidth(1) end end },
+                    { text = _("Medium (3px)"), checked_func = function() return self.pen_width == 3 end, callback = function() self.pen_width = 3 local a = getAndroid() if a and a.booxSetPenWidth then a.booxSetPenWidth(3) end end },
+                    { text = _("Bold (5px)"), checked_func = function() return self.pen_width == 5 end, callback = function() self.pen_width = 5 local a = getAndroid() if a and a.booxSetPenWidth then a.booxSetPenWidth(5) end end },
+                    { text = _("Heavy (8px)"), checked_func = function() return self.pen_width == 8 end, callback = function() self.pen_width = 8 local a = getAndroid() if a and a.booxSetPenWidth then a.booxSetPenWidth(8) end end },
                 }
             }
         }

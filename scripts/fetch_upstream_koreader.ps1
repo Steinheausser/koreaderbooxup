@@ -157,6 +157,9 @@ if (Test-Path $AndroidLua) {
 
 '@
         $Content = $Content.Replace("android.canWriteSettings = function()", "$BooxBridgeCode`n    android.canWriteSettings = function()")
+        if (-not $Content.Contains("_G.android = android")) {
+            $Content = $Content.Replace("package.loaded.android = android", "package.loaded.android = android`n    _G.android = android")
+        }
         [System.IO.File]::WriteAllText($AndroidLua, $Content)
     }
 }

@@ -2778,6 +2778,7 @@ local function run(android_app_state)
 
     -- register the "android" module (ourself)
     package.loaded.android = android
+    _G.android = android
 
     -- set up a sensible package.path
     package.path = "?.lua;"..android.dir.."/?.lua;"
