@@ -1,0 +1,16 @@
+# Build outputs
+output/
+temp_apk_extract/
+*.apk
+
+# Gradle and Android build files
+.gradle/
+build/
+app/build/
+**/build/
+local.properties
+.idea/
+*.iml
+
+# Ingested assets and binary libs (handled by scripts/fetch_upstream_koreader.ps1)
+android-launcher/app/libs/
