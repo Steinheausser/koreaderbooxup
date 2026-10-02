@@ -109,6 +109,7 @@ object DeviceInfo {
         ONYX_LOMONOSOV,
         ONYX_MAGICBOOK,
         ONYX_MAX,
+        ONYX_MAX_LUMI,
         ONYX_MAX2_PRO,
         ONYX_MONTECRISTO3,
         ONYX_NOTE,
@@ -508,6 +509,11 @@ object DeviceInfo {
             // Onyx Max
             MANUFACTURER == "onyx" && PRODUCT == "max" && DEVICE == "max"
             -> Id.ONYX_MAX
+
+            // Onyx Max Lumi
+            (MANUFACTURER == "onyx" || BRAND == "onyx") &&
+            (MODEL == "maxlumi" || PRODUCT == "maxlumi" || DEVICE == "maxlumi")
+            -> Id.ONYX_MAX_LUMI
 
             // Onyx Max2 Pro
             MANUFACTURER == "onyx" && PRODUCT == "max2pro" && DEVICE == "max2pro"

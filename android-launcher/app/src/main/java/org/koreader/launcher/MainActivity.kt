@@ -170,6 +170,7 @@ class MainActivity : NativeActivity(), LuaInterface,
         intent = null
     }
 
+
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         if (OnyxPenBridge.isDrawingActive()) {
             val toolType = ev.getToolType(0)
@@ -868,6 +869,10 @@ class MainActivity : NativeActivity(), LuaInterface,
 
     override fun booxIsSupported(): Boolean {
         return OnyxPenBridge.isSupported()
+    }
+
+    override fun booxIsPenDown(): Boolean {
+        return OnyxPenBridge.isPenActive()
     }
 
     override fun booxSetDrawingMode(enabled: Boolean, excludeRectsJson: String) {

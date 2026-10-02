@@ -98,6 +98,16 @@ if (Test-Path $AndroidLua) {
         end)
     end
 
+    android.booxIsPenDown = function()
+        return JNI:context(android.app.activity.vm, function(jni)
+            return jni:callBooleanMethod(
+                android.app.activity.clazz,
+                "booxIsPenDown",
+                "()Z"
+            )
+        end)
+    end
+
     android.booxSetDrawingMode = function(enabled, excludeRectsJson)
         JNI:context(android.app.activity.vm, function(jni)
             local json_str = jni.env[0].NewStringUTF(jni.env, excludeRectsJson or "[]")

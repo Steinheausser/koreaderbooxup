@@ -85,6 +85,7 @@ interface LuaInterface {
 
     // Onyx Boox low-latency stylus methods
     fun booxIsSupported(): Boolean
+    fun booxIsPenDown(): Boolean
     fun booxSetDrawingMode(enabled: Boolean, excludeRectsJson: String)
     fun booxSetPenWidth(width: Float)
     fun booxSetPenColor(color: Int)

@@ -64,6 +64,7 @@ object LightsFactory {
                 DeviceInfo.Id.ONYX_FAUST3,
                 DeviceInfo.Id.ONYX_KON_TIKI2,
                 DeviceInfo.Id.ONYX_LOMONOSOV,
+                DeviceInfo.Id.ONYX_MAX_LUMI,
                 DeviceInfo.Id.ONYX_NOTE3,
                 DeviceInfo.Id.ONYX_NOTE_AIR,
                 DeviceInfo.Id.ONYX_NOTE_PRO,
