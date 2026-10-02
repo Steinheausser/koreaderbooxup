@@ -9,3 +9,7 @@
 
 # preserve the line number information for debugging stack traces.
 -keepattributes SourceFile,LineNumberTable
+
+# Onyx SDK rules
+-keep class com.onyx.android.sdk.** { *; }
+-dontwarn com.onyx.android.sdk.**

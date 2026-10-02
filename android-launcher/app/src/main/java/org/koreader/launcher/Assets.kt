@@ -39,15 +39,33 @@ class Assets {
         }
     }
 
+    /* Bundled plugins go to filesDir/plugins only: KOReader also scans
+     * <storage>/koreader/plugins and does not dedupe by name, so a second
+     * copy there gets loaded as a second, competing plugin instance.
+     * Copying is skipped unless the APK changed since the last copy. */
     private fun extractBundledPlugins(activity: Activity) {
         try {
-            val internalPlugins = File(activity.filesDir, "plugins")
-            copyAssetFolder(activity.assets, "plugins", internalPlugins.absolutePath)
-
-            val sharedPlugins = File(MainApp.storage_path, "koreader/plugins")
-            if (sharedPlugins.exists() || sharedPlugins.mkdirs()) {
-                copyAssetFolder(activity.assets, "plugins", sharedPlugins.absolutePath)
+            // Remove the stale shared copy written by earlier builds
+            val sharedCopy = File(MainApp.storage_path, "koreader/plugins/boox_pen.koplugin")
+            if (sharedCopy.exists()) {
+                val removed = sharedCopy.deleteRecursively()
+                Log.i(tag, "Removed duplicate plugin copy ${sharedCopy.absolutePath}: $removed")
             }
+
+            val internalPlugins = File(activity.filesDir, "plugins")
+            val stampFile = File(internalPlugins, ".boox_pen_stamp")
+            val stamp = try {
+                @Suppress("DEPRECATION")
+                activity.packageManager.getPackageInfo(activity.packageName, 0).lastUpdateTime.toString()
+            } catch (e: Exception) {
+                ""
+            }
+            val installed = File(internalPlugins, "boox_pen.koplugin/main.lua").exists()
+            if (installed && stamp.isNotEmpty() && stampFile.exists() && stampFile.readText() == stamp) {
+                return
+            }
+            copyAssetFolder(activity.assets, "plugins", internalPlugins.absolutePath)
+            if (stamp.isNotEmpty()) stampFile.writeText(stamp)
         } catch (e: Exception) {
             Log.e(tag, "Error extracting bundled plugins", e)
         }
