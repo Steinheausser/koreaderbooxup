@@ -198,3 +198,65 @@ Root causes found by code reading (KOReader v2026.07.1 sources + onyxsdk jars):
   to the new strokes' bounding box.
 - Input adjust hooks chain forever; they are now installed once per process
   and dispatch to the active reader instance.
+
+## What Onyx Notes actually does (2026-10-26, reverse-engineered, untested here)
+
+Decompiled knote2/kreader2, framework.jar and libsurfaceflinger.so from the
+Max Lumi (fw 2023-12-12). Live ink is drawn by SurfaceFlinger itself: it opens
+the Wacom evdev node, runs the neopen brush engine and writes to `/dev/ebc`.
+Apps only drive it with Binder codes (`android.onyx.ViewUpdateHelper`), e.g.
+pen state `SET_SCREEN_HANDWRITING_PEN_STATE` 0 stop / 1 start / 2 drawing /
+3 pause / 4 erasing. Full write-up: `boox-pen-fastpath.md`.
+
+- **Pen-state regression (fixed):** `openRawDrawing()` sends state 1 and
+  `setRawDrawingEnabled(true)` sends 2; the bridge then sent 1 again, knocking
+  SF back to START. Now sends 2. Prime suspect for why `primeHardwarePen` was
+  "load-bearing".
+- **How Notes shows ink after lift:** it never toggles `enablePost`
+  (enter/leaveScribbleMode) per stroke. It redraws the dirty rect with update
+  mode `HAND_WRITING_REPAINT_MODE` (524290), which the panel commits while the
+  handwriting scheme stays active. `View.handwritingRepaint(view,l,t,r,b)`
+  exists on this firmware and is the same path.
+- A/B switches (read at each session enable; no rebuild needed):
+  - `adb shell setprop debug.koreader.boox.prime 0`: skip the delayed prime
+    stroke. Test first, now that the state is fixed.
+  - `adb shell setprop debug.koreader.boox.notes_mode 1`: no enter/leave
+    scribble on pen down/up; while a session is active, `einkUpdate` regions
+    go through `handwritingRepaint` instead of `refreshScreen`
+    (`OnyxPenBridge.routeRefresh`). Expect faster settle after lift and no
+    scheme-flip churn. Page turns while inking use the GU handwriting
+    waveform (no GC flash).
+  - Reset: set back to `1` / `0`, or reboot (debug props don't persist).
+  Check `logcat -s OnyxPenBridge` for `session flags notesMode=… prime=…`.
+
+### Results (2026-10-26, on-device)
+
+- State 2 fix: live ink is instant, and stays instant with `prime 0`.
+- Wedge notches in the settled ink fixed by the capsule renderer
+  (`drawCapsule`).
+- Stroke eraser: rubber end or side button (`enableSideBtnErase(true)`)
+  queues the path as `{e=1,p=...}`; `BooxPen:eraseAlong` deletes visible
+  strokes within 12px (+ half width), then does a full refresh. Verified.
+
+## Doubled strokes + text-anchored ink (2026-10-03, on-device)
+
+- **Start-to-end connector lines:** the SDK sends each stroke twice — per-move
+  callbacks AND one end-of-stroke `TouchPointList` (before `onEnd`). Both
+  were appended, so every stroke held its points twice and rendered a line
+  from its end back to its start (long ones were hidden by the teleport
+  splitter). Verified on-device: second half == first half exactly. Fix: a
+  list starting at the stroke's first point replaces the gathered moves.
+  Storage v3 repair undoubles saved strokes and drops identical neighbours.
+- **Text-anchored ink (storage v4, reflowable docs only):** strokes store
+  the xpointer of the nearest word (`a`), the font size at capture (`fs`)
+  and px offsets from that word's screen position; render places them at
+  the word's current position scaled by the font-size ratio (`anchor.lua`).
+  Strokes written within 4s/120px of the previous one share its anchor
+  (group height capped at 260px) so handwriting moves as one piece.
+  Visibility: anchor page (`getPageFromXPointer`, cached per
+  `getDocumentRenderingHash`) within the visible page numbers (dual-page
+  view shows 2); scroll mode uses doc-y range. Legacy page-keyed strokes
+  are converted the first time their page is shown (assumes the layout on
+  screen is the one they were written in). PDFs keep screen-relative coords.
+- Verified: 42 legacy strokes on a dual-page portrait spread converted in
+  ~45ms; screenshot diff vs. before conversion ~340 px (rounding only).

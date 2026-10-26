@@ -12,8 +12,8 @@ local MAX_WIDTH = 24
 -- ~1.0 at typical writing pressure, never below 0.75x the pen width.
 local PRESSURE_BASE = 0.75
 local PRESSURE_GAIN = 0.6
--- Joints sharper than this (cosine of the turn) get a round cap
-local SHARP_TURN_COS = 0.7
+-- Below this radius a diagonal capsule can break into disconnected pixels
+local MIN_RADIUS = 0.71
 
 local function toColor(c)
     if type(c) == "number" then
@@ -55,96 +55,123 @@ function Renderer.drawDisc(bb, cx, cy, d, color)
     end
 end
 
--- Thick line body: one span per pixel along the major axis, with the span
--- stretched by 1/cos(angle) so the visible thickness stays w on diagonals.
-function Renderer.drawSegment(bb, x0, y0, x1, y1, w0, w1, color, skip_first)
-    local dx = x1 - x0
-    local dy = y1 - y0
-    local adx, ady = abs(dx), abs(dy)
-    if adx < 0.5 and ady < 0.5 then
-        Renderer.drawDisc(bb, x1, y1, max(w0, w1), color)
+-- Filled capsule: every pixel centre within r of the segment (x0,y0)-(x1,y1).
+-- A capsule is convex, so each row is a single span (union of the two end
+-- discs and the body band), and consecutive capsules share their end disc,
+-- so joints are round at any angle: no notches, no cap bookkeeping.
+function Renderer.drawCapsule(bb, x0, y0, x1, y1, r, color)
+    if r < MIN_RADIUS then r = MIN_RADIUS end
+    local dx, dy = x1 - x0, y1 - y0
+    local len = sqrt(dx * dx + dy * dy)
+    if len < 0.5 then
+        Renderer.drawDisc(bb, x1, y1, 2 * r, color)
         return
     end
-    if adx >= ady then
-        local slope = dy / dx
-        local stretch = sqrt(1 + slope * slope)
-        local c0, c1 = floor(min(x0, x1)), floor(max(x0, x1))
-        for col = c0, c1 do
-            local t = ((col + 0.5) - x0) / dx
-            if t < 0 then t = 0 elseif t > 1 then t = 1 end
-            if not (skip_first and t == 0) then
-                local yc = y0 + dy * t
-                local half = (w0 + (w1 - w0) * t) * stretch / 2
-                local top = round(yc - half)
-                local h = round(yc + half) - top
-                bb:paintRect(col, top, 1, h > 0 and h or 1, color)
-            end
+    local ux, uy = dx / len, dy / len
+    local r2 = r * r
+    for row = floor(min(y0, y1) - r), floor(max(y0, y1) + r) do
+        local yc = row + 0.5
+        local xa, xb = math.huge, -math.huge
+        -- End discs
+        local ey0 = yc - y0
+        if ey0 * ey0 <= r2 then
+            local hw = sqrt(r2 - ey0 * ey0)
+            xa, xb = min(xa, x0 - hw), max(xb, x0 + hw)
         end
-    else
-        local slope = dx / dy
-        local stretch = sqrt(1 + slope * slope)
-        local r0, r1 = floor(min(y0, y1)), floor(max(y0, y1))
-        for row = r0, r1 do
-            local t = ((row + 0.5) - y0) / dy
-            if t < 0 then t = 0 elseif t > 1 then t = 1 end
-            if not (skip_first and t == 0) then
-                local xc = x0 + dx * t
-                local half = (w0 + (w1 - w0) * t) * stretch / 2
-                local left = round(xc - half)
-                local wd = round(xc + half) - left
-                bb:paintRect(left, row, wd > 0 and wd or 1, 1, color)
+        local ey1 = yc - y1
+        if ey1 * ey1 <= r2 then
+            local hw = sqrt(r2 - ey1 * ey1)
+            xa, xb = min(xa, x1 - hw), max(xb, x1 + hw)
+        end
+        -- Body band, with u = x - x0 on this row:
+        -- 0 <= u*ux + ey0*uy <= len and |ey0*ux - u*uy| <= r
+        local lo, hi = -math.huge, math.huge
+        local along = ey0 * uy
+        if abs(ux) > 1e-6 then
+            local a, b = -along / ux, (len - along) / ux
+            if a > b then a, b = b, a end
+            lo, hi = max(lo, a), min(hi, b)
+        elseif along < 0 or along > len then
+            lo, hi = 1, 0
+        end
+        local across = ey0 * ux
+        if abs(uy) > 1e-6 then
+            local a, b = (across - r) / uy, (across + r) / uy
+            if a > b then a, b = b, a end
+            lo, hi = max(lo, a), min(hi, b)
+        elseif abs(across) > r then
+            lo, hi = 1, 0
+        end
+        if lo <= hi then
+            xa, xb = min(xa, x0 + lo), max(xb, x0 + hi)
+        end
+        if xa <= xb then
+            -- Columns whose centres fall inside [xa, xb]; never less than
+            -- one pixel, so hairlines stay connected.
+            local c0 = math.ceil(xa - 0.5)
+            local c1 = floor(xb - 0.5)
+            if c1 < c0 then
+                c0 = floor((xa + xb) / 2)
+                c1 = c0
             end
+            bb:paintRect(c0, row, c1 - c0 + 1, 1, color)
         end
     end
 end
 
--- stroke = { w = pen width, c = gray, p = {x,y,p, ...} } (normalized coords)
-function Renderer.renderStroke(bb, stroke, screen_w, screen_h, weight)
+-- Point transform: screen = (o + v * s) per axis. Screen-normalized strokes
+-- use { sx = screen_w, sy = screen_h, ox = 0, oy = 0 }; anchored strokes use
+-- the anchor's screen position as origin and the font-size ratio as scale.
+function Renderer.screenTransform(screen_w, screen_h, ox, oy)
+    return { sx = screen_w, sy = screen_h, ox = ox or 0, oy = oy or 0 }
+end
+
+-- stroke = { w = pen width, c = gray, p = {x,y,p, ...} }
+function Renderer.renderStroke(bb, stroke, tx, weight)
     local pts = stroke.p
     if not pts or #pts < 3 then return end
     local base_w = stroke.w or 5
     local color = toColor(stroke.c or 0)
     local n = floor(#pts / 3)
 
-    local px = pts[1] * screen_w
-    local py = pts[2] * screen_h
+    local sx, sy, ox, oy = tx.sx, tx.sy, tx.ox, tx.oy
+    local px = ox + pts[1] * sx
+    local py = oy + pts[2] * sy
     local pw = Renderer.pointWidth(base_w, pts[3], weight)
-    Renderer.drawDisc(bb, px, py, pw, color)
-    if n == 1 then return end
 
-    local pdx, pdy -- previous segment direction (unit vector)
+    local drew = false
     for i = 2, n do
         local j = (i - 1) * 3 + 1
-        local x = pts[j] * screen_w
-        local y = pts[j + 1] * screen_h
+        local x = ox + pts[j] * sx
+        local y = oy + pts[j + 1] * sy
         local w = Renderer.pointWidth(base_w, pts[j + 2], weight)
         local dx, dy = x - px, y - py
-        local len = sqrt(dx * dx + dy * dy)
-        if len >= 0.5 then
-            local ux, uy = dx / len, dy / len
-            if pdx and (pdx * ux + pdy * uy) < SHARP_TURN_COS then
-                Renderer.drawDisc(bb, px, py, pw, color)
-            end
-            Renderer.drawSegment(bb, px, py, x, y, pw, w, color, pdx ~= nil)
-            pdx, pdy = ux, uy
+        if dx * dx + dy * dy >= 0.25 then
+            -- Radius = half the mean width of the two ends; segments are
+            -- only a few px long, so pressure still tapers smoothly.
+            Renderer.drawCapsule(bb, px, py, x, y, (pw + w) / 4, color)
+            drew = true
             px, py, pw = x, y, w
         else
             pw = max(pw, w)
         end
     end
-    Renderer.drawDisc(bb, px, py, pw, color)
-end
-
-function Renderer.renderPageStrokes(bb, strokes, screen_w, screen_h, weight)
-    if not strokes or #strokes == 0 then return end
-    for _, stroke in ipairs(strokes) do
-        Renderer.renderStroke(bb, stroke, screen_w, screen_h, weight)
+    if not drew then
+        Renderer.drawDisc(bb, px, py, pw, color)
     end
 end
 
--- Screen-space bounding box {x, y, w, h} of a set of strokes, padded by
--- their maximum rendered width. Returns nil for no points.
-function Renderer.strokesBounds(strokes, screen_w, screen_h, weight)
+function Renderer.renderPageStrokes(bb, strokes, tx, weight)
+    if not strokes or #strokes == 0 then return end
+    for _, stroke in ipairs(strokes) do
+        Renderer.renderStroke(bb, stroke, tx, weight)
+    end
+end
+
+-- Screen-space bounding box {x, y, w, h} of a set of strokes drawn with
+-- transform tx, padded by their maximum rendered width and clamped to the
+-- screen. Returns nil for no points.
+function Renderer.strokesBounds(strokes, tx, screen_w, screen_h, weight)
     local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
     local maxw = 0
     for _, stroke in ipairs(strokes) do
@@ -163,10 +190,11 @@ function Renderer.strokesBounds(strokes, screen_w, screen_h, weight)
     -- Extra margin so the refresh also wipes the live hardware ink, whose
     -- exact pressure-dependent width is up to the firmware.
     local pad = math.ceil(maxw / 2) + 6
-    local left = max(0, floor(x0 * screen_w) - pad)
-    local top = max(0, floor(y0 * screen_h) - pad)
-    local right = min(screen_w, math.ceil(x1 * screen_w) + pad)
-    local bottom = min(screen_h, math.ceil(y1 * screen_h) + pad)
+    local left = max(0, floor(tx.ox + x0 * tx.sx) - pad)
+    local top = max(0, floor(tx.oy + y0 * tx.sy) - pad)
+    local right = min(screen_w, math.ceil(tx.ox + x1 * tx.sx) + pad)
+    local bottom = min(screen_h, math.ceil(tx.oy + y1 * tx.sy) + pad)
+    if right <= left or bottom <= top then return nil end
     return { x = left, y = top, w = right - left, h = bottom - top }
 end
 

@@ -67,6 +67,8 @@ object OnyxPenBridge {
 
     private var lastAddedX = -1f
     private var lastAddedY = -1f
+    private var firstX = -1f
+    private var firstY = -1f
 
     // Physical pen state, exposed to Lua so gesture suppression can tell
     // pen contacts apart from finger taps (the pen also emits emulated
@@ -77,16 +79,40 @@ object OnyxPenBridge {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // A/B switches, re-read at every session start so they can be flipped
+    // over adb without a rebuild (debug.* props need no root):
+    //   adb shell setprop debug.koreader.boox.notes_mode 1
+    //   adb shell setprop debug.koreader.boox.prime 0
+    // notes_mode copies Onyx Notes (knote2, fw 2023-12): no enablePost toggling
+    // per stroke; while a session is active, KOReader's refreshes go through
+    // the firmware's handwritingRepaint (HANDWRITING_REPAINT -> SurfaceFlinger),
+    // which the panel commits even while the handwriting scheme is active.
+    @Volatile private var notesMode = false
+    private var primeEnabled = true
+
+    private fun boolProp(name: String, default: Boolean): Boolean {
+        return try {
+            val value = Class.forName("android.os.SystemProperties")
+                .getMethod("get", String::class.java, String::class.java)
+                .invoke(null, name, "") as String
+            if (value.isEmpty()) default else value == "1" || value.equals("true", ignoreCase = true)
+        } catch (_: Throwable) {
+            default
+        }
+    }
+
     private val callback = object : RawInputCallback() {
         override fun onBeginRawDrawing(b: Boolean, point: TouchPoint) {
             Log.d(TAG, "onBeginRawDrawing at (${point.x}, ${point.y}, p=${point.pressure})")
             penDown = true
-            try {
-                overlaySurfaceView?.let {
-                    EpdController.enterScribbleMode(it)
+            if (!notesMode) {
+                try {
+                    overlaySurfaceView?.let {
+                        EpdController.enterScribbleMode(it)
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "OnyxPenBridge: enter scribble on pen-down FAILED", e)
                 }
-            } catch (e: Throwable) {
-                Log.e(TAG, "OnyxPenBridge: enter scribble on pen-down FAILED", e)
             }
             synchronized(strokeLock) {
                 resetActiveStroke()
@@ -97,35 +123,22 @@ object OnyxPenBridge {
         override fun onEndRawDrawing(b: Boolean, point: TouchPoint) {
             synchronized(strokeLock) {
                 addPoint(point)
-                if (activePointCount >= 1) {
-                    if (activePointCount == 1) {
-                        // Duplicate single point so renderer can draw a dot
-                        firstPointText?.let { activePoints.append(it) }
-                        activePointCount++
-                    }
-                    // Drop the trailing comma
-                    activePoints.setLength(activePoints.length - 1)
-                    val stroke = StringBuilder(activePoints.length + 24)
-                        .append("{w=").append(fmt(currentStrokeWidth, 1))
-                        .append(",p={").append(activePoints).append("}}")
-                        .toString()
-                    pendingStrokes.add(stroke)
-                    Log.d(TAG, "Stroke queued: $activePointCount points")
-                }
-                resetActiveStroke()
+                queueActiveStroke("w=" + fmt(currentStrokeWidth, 1))
             }
             penDown = false
             lastPenEndUptime = android.os.SystemClock.uptimeMillis()
             // Drop the handwriting scheme at lift: while it is active the
             // firmware gates every panel update, so the Lua layer's vector
             // repaint (polled ~100ms later) would never reach the panel.
-            // Re-entered on the next pen-down.
-            try {
-                overlaySurfaceView?.let {
-                    EpdController.leaveScribbleMode(it)
+            // Re-entered on the next pen-down. Notes mode never enters it.
+            if (!notesMode) {
+                try {
+                    overlaySurfaceView?.let {
+                        EpdController.leaveScribbleMode(it)
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "OnyxPenBridge: leave scribble on pen-up FAILED", e)
                 }
-            } catch (e: Throwable) {
-                Log.e(TAG, "OnyxPenBridge: leave scribble on pen-up FAILED", e)
             }
         }
 
@@ -137,19 +150,84 @@ object OnyxPenBridge {
 
         override fun onRawDrawingTouchPointListReceived(pointList: TouchPointList) {
             synchronized(strokeLock) {
-                val pts = pointList.points
-                if (pts != null) {
-                    for (p in pts) {
-                        addPoint(p)
-                    }
-                }
+                mergePointList(pointList)
             }
         }
 
-        override fun onBeginRawErasing(b: Boolean, point: TouchPoint) {}
-        override fun onEndRawErasing(b: Boolean, point: TouchPoint) {}
-        override fun onRawErasingTouchPointMoveReceived(point: TouchPoint) {}
-        override fun onRawErasingTouchPointListReceived(pointList: TouchPointList) {}
+        // Eraser (rubber end, or side button with enableSideBtnErase): the
+        // path is gathered like a stroke and queued with e=1; Lua deletes
+        // the strokes it crosses. No scribble-mode toggling: nothing is
+        // inked live, and the Lua repaint must reach the panel.
+        override fun onBeginRawErasing(b: Boolean, point: TouchPoint) {
+            Log.d(TAG, "onBeginRawErasing at (${point.x}, ${point.y})")
+            penDown = true
+            synchronized(strokeLock) {
+                resetActiveStroke()
+                addPoint(point)
+            }
+        }
+
+        override fun onEndRawErasing(b: Boolean, point: TouchPoint) {
+            synchronized(strokeLock) {
+                addPoint(point)
+                queueActiveStroke("e=1")
+            }
+            penDown = false
+            lastPenEndUptime = android.os.SystemClock.uptimeMillis()
+        }
+
+        override fun onRawErasingTouchPointMoveReceived(point: TouchPoint) {
+            synchronized(strokeLock) {
+                addPoint(point)
+            }
+        }
+
+        override fun onRawErasingTouchPointListReceived(pointList: TouchPointList) {
+            synchronized(strokeLock) {
+                mergePointList(pointList)
+            }
+        }
+    }
+
+    // Caller holds strokeLock. Queues the gathered points as a Lua table
+    // literal {<fields>,p={x,y,p,...}} and resets the active stroke.
+    private fun queueActiveStroke(fields: String) {
+        if (activePointCount >= 1) {
+            if (activePointCount == 1) {
+                // Duplicate single point so renderer can draw a dot
+                firstPointText?.let { activePoints.append(it) }
+                activePointCount++
+            }
+            // Drop the trailing comma
+            activePoints.setLength(activePoints.length - 1)
+            val stroke = StringBuilder(activePoints.length + fields.length + 12)
+                .append('{').append(fields)
+                .append(",p={").append(activePoints).append("}}")
+                .toString()
+            pendingStrokes.add(stroke)
+            Log.d(TAG, "Stroke queued ($fields): $activePointCount points")
+        }
+        resetActiveStroke()
+    }
+
+    // Caller holds strokeLock. The SDK delivers the whole stroke again as one
+    // list (before onEnd), on top of the per-move callbacks. Appending it
+    // doubled every stroke and drew a straight line from its end back to its
+    // start. A list starting at the stroke's first point is that complete
+    // copy and replaces what moves gathered; anything else (chunked
+    // delivery) is appended.
+    private fun mergePointList(pointList: TouchPointList) {
+        val pts = pointList.points
+        if (pts == null || pts.isEmpty()) return
+        val first = pts[0]
+        val dx = first.x - firstX
+        val dy = first.y - firstY
+        if (activePointCount > 0 && dx * dx + dy * dy < 4f) {
+            resetActiveStroke()
+        }
+        for (p in pts) {
+            addPoint(p)
+        }
     }
 
     fun isSupported(): Boolean {
@@ -317,7 +395,11 @@ object OnyxPenBridge {
             // the Lua renderer maps it to a width multiplier.
             val text = fmt(point.x, 1) + "," + fmt(point.y, 1) + "," +
                 fmt(normalizedPressure(point.pressure), 2) + ","
-            if (firstPointText == null) firstPointText = text
+            if (firstPointText == null) {
+                firstPointText = text
+                firstX = point.x
+                firstY = point.y
+            }
             activePoints.append(text)
             activePointCount++
         } catch (e: Exception) {
@@ -340,6 +422,10 @@ object OnyxPenBridge {
                 pendingExcludeRectsJson = excludeRectsJson
                 return
             }
+
+            notesMode = boolProp("debug.koreader.boox.notes_mode", false)
+            primeEnabled = boolProp("debug.koreader.boox.prime", true)
+            Log.i(TAG, "OnyxPenBridge: session flags notesMode=$notesMode prime=$primeEnabled")
 
             try {
                 val helper = touchHelper ?: TouchHelper.create(surfaceView, true, callback).also {
@@ -385,6 +471,8 @@ object OnyxPenBridge {
                 // Pen-only: keep finger/palm contacts out of the raw stream
                 // (they used to merge into strokes as long teleport jumps).
                 helper.enableFingerTouch(false)
+                // Side button held = erase (the rubber end erases regardless)
+                helper.enableSideBtnErase(true)
                 isDrawingActive = true
                 Log.i(TAG, "OnyxPenBridge: Drawing mode ENABLED on SurfaceView (${screenW}x${screenH}, ${excludeList.size} exclusion zones)")
                 try {
@@ -394,7 +482,13 @@ object OnyxPenBridge {
                     // onBeginRawDrawing enters it at every pen-down (and
                     // onEndRawDrawing leaves it), which covers the first
                     // stroke as well.
-                    EpdController.setScreenHandWritingPenState(surfaceView, 1)
+                    //
+                    // State 2 (DRAWING), not 1 (START): openRawDrawing() already
+                    // sent 1 and setRawDrawingEnabled(true) moved SurfaceFlinger
+                    // on to 2 (EpdPenManager.startDrawing/resumeDrawing in
+                    // onyxsdk-pen 1.3.6). Sending 1 here knocked it back to START,
+                    // the likely reason live ink needed the delayed prime.
+                    EpdController.setScreenHandWritingPenState(surfaceView, 2)
                 } catch (e: Throwable) {
                     Log.e(TAG, "OnyxPenBridge: setScreenHandWritingPenState FAILED", e)
                 }
@@ -413,7 +507,9 @@ object OnyxPenBridge {
                 } catch (e: Throwable) {
                     Log.e(TAG, "OnyxPenBridge: setting hardware stroke params FAILED", e)
                 }
-                primeHardwarePen(surfaceView)
+                if (primeEnabled) {
+                    primeHardwarePen(surfaceView)
+                }
             } catch (e: Throwable) {
                 Log.e(TAG, "Error enabling drawing mode on SurfaceView", e)
             }
@@ -502,6 +598,31 @@ object OnyxPenBridge {
             }
             applyDrawingMode(activity, enabled, excludeRectsJson)
         }
+    }
+
+    /**
+     * Notes mode only: sends an eink refresh request as a handwriting repaint
+     * (what Notes' PartialRefreshRequest does via HAND_WRITING_REPAINT_MODE),
+     * so it reaches the panel while the handwriting scheme is active.
+     * Coordinates are relative to [view], like View.refreshScreen. A zero-size
+     * region means the whole view. Returns false when the caller should use
+     * its normal refresh path.
+     */
+    fun routeRefresh(view: android.view.View, delay: Long, x: Int, y: Int, width: Int, height: Int): Boolean {
+        if (!notesMode || !isDrawingActive) return false
+        val full = width <= 0 || height <= 0
+        val left = if (full) 0 else x
+        val top = if (full) 0 else y
+        val right = if (full) view.width else x + width
+        val bottom = if (full) view.height else y + height
+        mainHandler.postDelayed({
+            try {
+                EpdController.handwritingRepaint(view, left, top, right, bottom)
+            } catch (e: Throwable) {
+                Log.e(TAG, "OnyxPenBridge: handwritingRepaint FAILED", e)
+            }
+        }, delay.coerceAtLeast(0L))
+        return true
     }
 
     fun setPenWidth(width: Float) {

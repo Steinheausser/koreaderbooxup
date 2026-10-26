@@ -6,6 +6,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 local logger = require("logger")
 
+local Anchor = require("anchor")
 local EpubStorage = require("epub_storage")
 local Renderer = require("renderer")
 
@@ -76,6 +77,19 @@ local STROKE_SPLIT_GAP = 0.05
 -- Delay between the reader's first paint and auto-enabling inking, so the
 -- first page refresh reaches the panel before the pen session starts
 local AUTO_ENABLE_DELAY = 1
+-- A stroke written within this many seconds and px of the previous stroke
+-- shares its text anchor, so a handwritten word or sentence moves as one
+-- piece when the text reflows instead of being torn apart across lines.
+-- Groups stop growing past ANCHOR_GROUP_MAX_H tall (about two lines of
+-- handwriting), so separate marks further down get their own anchors.
+local ANCHOR_GROUP_SECONDS = 4
+local ANCHOR_GROUP_GAP_PX = 120
+local ANCHOR_GROUP_MAX_H = 260
+-- The eraser deletes strokes passing within this many px of its path
+-- (plus half the stroke's width)
+local ERASER_REACH_PX = 12
+
+local EMPTY = {}
 
 -- Input hooks chain forever once registered, so they are installed once per
 -- process and act on whichever reader instance is currently active.
@@ -226,6 +240,12 @@ function BooxPen:onReaderReady()
 
     -- Initialize document sidecar storage
     self.storage = EpubStorage:new(self.ui.document.file)
+    -- Reflowable documents (EPUB, FB2, ...) anchor ink to the text;
+    -- fixed-layout ones (PDF, CBZ) keep screen-relative page coordinates.
+    self.anchored_mode = Anchor.isSupported(self.ui)
+    logger.info("BooxPen: text-anchored ink", self.anchored_mode and "enabled" or "disabled")
+    self.anchor_cache = nil
+    self.anchor_group = nil
 
     -- Hook into ReaderView:paintTo to render vector ink over the document page
     local reader_view = self.ui.view
@@ -304,6 +324,132 @@ function BooxPen:getCurrentPageNumber()
     return 1
 end
 
+-- Anchored strokes visible in the current view, as { stroke, tx } items
+-- placing each at its anchor's current screen position.
+function BooxPen:getVisibleAnchored()
+    local list = self.storage:getAnchored()
+    if #list == 0 then return EMPTY end
+    local doc = self.ui.document
+
+    -- Page and document position of every anchor, recomputed only when the
+    -- layout (or the stroke list) changes
+    local key = Anchor.layoutKey(doc) .. ":" .. self.storage.anchored_rev
+    local cache = self.anchor_cache
+    if not cache or cache.key ~= key then
+        cache = { key = key, ay = {}, page = {} }
+        for _, s in ipairs(list) do
+            local ok, ay = pcall(doc.getPosFromXPointer, doc, s.a)
+            if ok and ay then cache.ay[s] = ay end
+            local okp, pg = pcall(doc.getPageFromXPointer, doc, s.a)
+            if okp and pg then cache.page[s] = pg end
+        end
+        self.anchor_cache = cache
+    end
+
+    -- Page mode: the pages on screen (two in dual-page view). Scroll mode:
+    -- anchors within a screen above/below the current position.
+    local page_mode = self.view.view_mode == "page"
+    local first_page, last_page, lo, hi
+    if page_mode then
+        first_page = doc:getCurrentPage()
+        local okn, n = pcall(doc.getVisiblePageNumberCount, doc)
+        last_page = first_page + ((okn and tonumber(n) or 1) - 1)
+    else
+        local top = doc:getCurrentPos()
+        local screen_h = Screen:getHeight()
+        lo, hi = top - screen_h, top + screen_h
+    end
+    local fs_now = Anchor.fontSize(doc)
+    local out = {}
+    for _, s in ipairs(list) do
+        local visible
+        if page_mode then
+            local pg = cache.page[s]
+            visible = pg and pg >= first_page and pg <= last_page
+        else
+            local ay = cache.ay[s]
+            visible = ay and ay >= lo and ay < hi
+        end
+        if visible then
+            local rx, ry = Anchor.screenPos(doc, s.a)
+            if rx then
+                local scale = (s.fs and s.fs > 0 and fs_now > 0) and fs_now / s.fs or 1
+                table.insert(out, { stroke = s, tx = { sx = scale, sy = scale, ox = rx, oy = ry } })
+            end
+        end
+    end
+    return out
+end
+
+-- Anchors a stroke given in screen px, sharing the previous stroke's anchor
+-- when it belongs to the same burst of writing. Returns the anchored stroke
+-- or nil when no text position could be found.
+function BooxPen:anchorStroke(px_points, w, c, ignore_time)
+    local doc = self.ui.document
+    local box = { Anchor.bbox(px_points) }
+    local view_key = Anchor.layoutKey(doc) .. "@" .. tostring(doc:getCurrentPos())
+    local now = os.time()
+    local g = self.anchor_group
+    local joins = g and g.view_key == view_key
+        and (ignore_time or now - g.t <= ANCHOR_GROUP_SECONDS)
+        and Anchor.boxGap(g.last_box, box) <= ANCHOR_GROUP_GAP_PX
+        and math.max(g.box[4], box[4]) - math.min(g.box[2], box[2]) <= ANCHOR_GROUP_MAX_H
+    if joins then
+        g.box = { math.min(g.box[1], box[1]), math.min(g.box[2], box[2]),
+                  math.max(g.box[3], box[3]), math.max(g.box[4], box[4]) }
+    else
+        local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+        local xp, rx, ry = Anchor.find(doc, (box[1] + box[3]) / 2, (box[2] + box[4]) / 2, screen_w, screen_h)
+        if not xp then return nil end
+        g = { view_key = view_key, xp = xp, rx = rx, ry = ry, fs = Anchor.fontSize(doc), box = box }
+        self.anchor_group = g
+    end
+    g.last_box = box
+    g.t = now
+    return Anchor.makeStroke(px_points, w, c, g.xp, g.rx, g.ry, g.fs)
+end
+
+-- Strokes saved before anchoring existed are screen-positioned per page
+-- number. Convert the current page's ones, assuming the layout they were
+-- written in is the one on screen now (it is what they were drawn over).
+function BooxPen:convertLegacyPage(page)
+    if not self.storage or not self.anchored_mode then return end
+    -- Legacy strokes were captured per screen in page mode (one key per
+    -- screen, also in dual-page view); only convert them on that screen.
+    local view_mode = self.view.view_mode
+    local current = self:getCurrentPageNumber()
+    if view_mode ~= "page" or page ~= current then
+        logger.info("BooxPen: not anchoring legacy page", page, "view_mode", view_mode, "current", current)
+        return
+    end
+    local list = self.storage:takePage(page)
+    if not list then return end
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local kept = {}
+    local converted = 0
+    -- Legacy strokes carry no timing: group them by proximity only
+    self.anchor_group = nil
+    for _, s in ipairs(list) do
+        local px = {}
+        for j = 1, #s.p - 2, 3 do
+            px[j] = s.p[j] * screen_w
+            px[j + 1] = s.p[j + 1] * screen_h
+            px[j + 2] = s.p[j + 2]
+        end
+        local a = self:anchorStroke(px, s.w, s.c, true)
+        if a then
+            self.storage:addAnchored(a)
+            converted = converted + 1
+        else
+            table.insert(kept, s)
+        end
+    end
+    self.anchor_group = nil
+    for _, s in ipairs(kept) do self.storage:addStroke(page, s) end
+    logger.info("BooxPen: anchored", converted, "legacy strokes on page", page, "kept", #kept)
+    self:refreshView()
+end
+
 function BooxPen:onPaintPage(bb, x, y)
     if self.pending_auto_enable then
         self.pending_auto_enable = false
@@ -322,7 +468,33 @@ function BooxPen:onPaintPage(bb, x, y)
     local strokes = self.storage:getStrokes(current_page)
     if #strokes > 0 then
         logger.dbg("BooxPen: rendering", #strokes, "strokes on page", current_page)
-        Renderer.renderPageStrokes(bb, strokes, Screen:getWidth(), Screen:getHeight(), self.ink_weight)
+        Renderer.renderPageStrokes(bb, strokes,
+            Renderer.screenTransform(Screen:getWidth(), Screen:getHeight(), x, y), self.ink_weight)
+        self.legacy_tried = self.legacy_tried or {}
+        if self.anchored_mode and not self.legacy_pending and not self.legacy_tried[current_page] then
+            -- Converted outside of painting; drawn as-is in the meantime.
+            -- Once per page per session: strokes that cannot be anchored
+            -- stay screen-positioned instead of retrying on every repaint.
+            self.legacy_tried[current_page] = true
+            self.legacy_pending = true
+            logger.info("BooxPen: scheduling legacy anchoring for page", current_page)
+            UIManager:nextTick(function()
+                self.legacy_pending = false
+                self:convertLegacyPage(current_page)
+            end)
+        end
+    end
+
+    if self.anchored_mode then
+        local items = self:getVisibleAnchored()
+        for _, it in ipairs(items) do
+            local tx = it.tx
+            tx.ox, tx.oy = tx.ox + x, tx.oy + y
+            Renderer.renderStroke(bb, it.stroke, tx, self.ink_weight)
+        end
+        if #items > 0 then
+            logger.dbg("BooxPen: rendered", #items, "anchored strokes")
+        end
     end
 end
 
@@ -450,10 +622,15 @@ function BooxPen:pollStrokes()
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
     local added = {}
+    local erased = false
 
     for _, stroke in ipairs(strokes) do
         local pts = stroke.p
-        if type(pts) == "table" and #pts >= 3 then
+        if stroke.e then
+            if type(pts) == "table" and #pts >= 3 and self:eraseAlong(pts) then
+                erased = true
+            end
+        elseif type(pts) == "table" and #pts >= 3 then
             -- Normalize coordinates (0..1) so annotations scale across orientations/resolutions
             local norm = {}
             for j = 1, #pts - 2, 3 do
@@ -461,6 +638,8 @@ function BooxPen:pollStrokes()
                 norm[j + 1] = round(pts[j + 1] / screen_h, 10000)
                 norm[j + 2] = round(pts[j + 2] or 0.5, 100)
             end
+            -- Guard against a doubled point list (see EpubStorage.undouble)
+            norm = EpubStorage.undouble(norm)
             -- Split on teleport jumps (pen micro-lifts, stray contacts):
             -- a single raw stroke with a huge gap would otherwise render as
             -- a long straight connector line across the page.
@@ -474,25 +653,122 @@ function BooxPen:pollStrokes()
                         c = self.pen_color,
                         p = seg,
                     }
-                    self.storage:addStroke(current_page, s)
+                    local anchored
+                    if self.anchored_mode then
+                        local px = {}
+                        for j = 1, #seg - 2, 3 do
+                            px[j] = seg[j] * screen_w
+                            px[j + 1] = seg[j + 1] * screen_h
+                            px[j + 2] = seg[j + 2]
+                        end
+                        anchored = self:anchorStroke(px, s.w, s.c)
+                    end
+                    if anchored then
+                        self.storage:addAnchored(anchored)
+                    else
+                        self.storage:addStroke(current_page, s)
+                    end
                     table.insert(added, s)
                 end
             end
         end
     end
 
+    if erased and self.show_annotations then
+        -- Erased ink can sit anywhere under the eraser path; a full repaint
+        -- also wipes what the panel still shows of it.
+        self:refreshView()
+        return
+    end
+
     -- Repaint and refresh only the area the new strokes cover
     if #added > 0 and self.show_annotations then
-        local region = Renderer.strokesBounds(added, screen_w, screen_h, self.ink_weight)
+        local region = Renderer.strokesBounds(added, Renderer.screenTransform(screen_w, screen_h),
+            screen_w, screen_h, self.ink_weight)
         logger.dbg("BooxPen:", #added, "strokes added, refreshing", region and region.w, region and region.h)
         self:refreshView(region)
     end
 end
 
+-- True when any point of `stroke` (drawn with transform tx) lies within
+-- `reach` px of a point of the eraser path `ex` (flat screen px {x,y,p,...}),
+-- whose bounding box is `ebox` = {x0, y0, x1, y1}.
+local function strokeHit(stroke, tx, ex, ebox, reach)
+    local pts = stroke.p
+    local sx, sy, ox, oy = tx.sx, tx.sy, tx.ox, tx.oy
+    local r2 = reach * reach
+    for j = 1, #pts - 2, 3 do
+        local x = ox + pts[j] * sx
+        local y = oy + pts[j + 1] * sy
+        if x >= ebox[1] - reach and x <= ebox[3] + reach
+                and y >= ebox[2] - reach and y <= ebox[4] + reach then
+            for k = 1, #ex - 2, 3 do
+                local dx, dy = x - ex[k], y - ex[k + 1]
+                if dx * dx + dy * dy <= r2 then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- Stroke eraser: deletes every visible stroke the eraser path (screen px,
+-- flat {x,y,p,...}) passes over. Returns true when anything was removed.
+function BooxPen:eraseAlong(ex)
+    if not self.storage then return false end
+    local ebox = { Anchor.bbox(ex) }
+    local removed = 0
+
+    local page = self:getCurrentPageNumber()
+    local page_tx = Renderer.screenTransform(Screen:getWidth(), Screen:getHeight())
+    local set = {}
+    for _, s in ipairs(self.storage:getStrokes(page)) do
+        local reach = ERASER_REACH_PX + Renderer.pointWidth(s.w or 5, 1, self.ink_weight) / 2
+        if strokeHit(s, page_tx, ex, ebox, reach) then
+            set[s] = true
+            removed = removed + 1
+        end
+    end
+    if removed > 0 then self.storage:removeStrokes(page, set) end
+
+    if self.anchored_mode then
+        local aset, n = {}, 0
+        for _, it in ipairs(self:getVisibleAnchored()) do
+            local s = it.stroke
+            local reach = ERASER_REACH_PX + Renderer.pointWidth(s.w or 5, 1, self.ink_weight) / 2
+            if strokeHit(s, it.tx, ex, ebox, reach) then
+                aset[s] = true
+                n = n + 1
+            end
+        end
+        if n > 0 then
+            self.storage:removeAnchored(aset)
+            removed = removed + n
+        end
+    end
+    logger.info("BooxPen: eraser removed", removed, "strokes")
+    return removed > 0
+end
+
 function BooxPen:undo()
     if not self.storage then return end
     local current_page = self:getCurrentPageNumber()
-    self.storage:undo(current_page)
+    local removed = false
+    if self.anchored_mode then
+        -- Newest anchored stroke in view (the list is in writing order)
+        local visible = {}
+        for _, it in ipairs(self:getVisibleAnchored()) do visible[it.stroke] = true end
+        local list = self.storage:getAnchored()
+        for i = #list, 1, -1 do
+            if visible[list[i]] then
+                self.storage:removeAnchored({ [list[i]] = true })
+                removed = true
+                break
+            end
+        end
+    end
+    if not removed then
+        self.storage:undo(current_page)
+    end
     self:refreshView()
     UIManager:show(require("ui/widget/notification"):new{
         text = _("Undid last stroke"),
@@ -503,6 +779,11 @@ end
 function BooxPen:clearPage()
     if not self.storage then return end
     local current_page = self:getCurrentPageNumber()
+    if self.anchored_mode then
+        local set = {}
+        for _, it in ipairs(self:getVisibleAnchored()) do set[it.stroke] = true end
+        self.storage:removeAnchored(set)
+    end
     self.storage:clearPage(current_page)
     self:refreshView()
     UIManager:show(require("ui/widget/notification"):new{

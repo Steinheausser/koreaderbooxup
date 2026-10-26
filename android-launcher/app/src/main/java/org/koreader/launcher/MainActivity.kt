@@ -365,6 +365,7 @@ class MainActivity : NativeActivity(), LuaInterface,
             "requesting epd update, mode:%d, delay:%d, [x:%d, y:%d, w:%d, h:%d]",
             mode, delay, x, y, width, height))
 
+        if (OnyxPenBridge.routeRefresh(rootView, delay, x, y, width, height)) return
         device.epd.setEpdMode(rootView, mode, delay, x, y, width, height, null)
     }
 

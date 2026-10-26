@@ -7,8 +7,12 @@ local EpubStorage = {}
 EpubStorage.__index = EpubStorage
 
 -- On-disk format version. v1 was JSON with {x,y,p} point objects; v2 is a
--- Lua table literal with flat point arrays {x,y,p, x,y,p, ...}.
-EpubStorage.VERSION = 2
+-- Lua table literal with flat point arrays {x,y,p, x,y,p, ...}; v3 is the
+-- same layout with doubled strokes repaired (see repairDoubled); v4 adds
+-- `anchored`: reflowable-document strokes tied to a text position
+-- ({w, c, a = xpointer, fs = font size at capture, p = {dx,dy,p,...}} with
+-- offsets in px from the anchor at that font size).
+EpubStorage.VERSION = 4
 
 -- Normalized gap above which one point list is split into segments.
 -- Must match the capture-time splitter in main.lua (STROKE_SPLIT_GAP).
@@ -18,6 +22,10 @@ EpubStorage.SPLIT_GAP = 0.05
 EpubStorage.SAVE_DELAY = 3
 
 local EMPTY = {}
+
+local function floor_div3(n)
+    return math.floor(n / 3)
+end
 
 local function round(v, scale)
     return math.floor(v * scale + 0.5) / scale
@@ -68,14 +76,79 @@ function EpubStorage.splitFlat(flat, gap)
     return segments
 end
 
+-- Earlier builds appended the SDK's end-of-stroke point list to the points
+-- already gathered while moving, so a stroke holds its own points twice,
+-- with a straight connector from the end back to the start. Returns the
+-- single copy, or the input when it is not doubled.
+function EpubStorage.undouble(flat)
+    local n = floor_div3(#flat)
+    if n < 4 then return flat end
+    local x1, y1 = flat[1], flat[2]
+    for h = math.ceil(n / 2), n - 1 do
+        local j = h * 3 + 1 -- point h+1
+        if flat[j] == x1 and flat[j + 1] == y1 then
+            local m = n - h -- length of the second copy
+            if m >= h - 1 then
+                local match = true
+                for k = 1, math.min(h, m) * 3 do
+                    if flat[k] ~= flat[h * 3 + k] then match = false break end
+                end
+                if match then
+                    -- keep the longer copy (the second may carry the end point)
+                    local keep_from, keep_n = 1, h
+                    if m > h then keep_from, keep_n = h + 1, m end
+                    local out = {}
+                    local base = (keep_from - 1) * 3
+                    for k = 1, keep_n * 3 do out[k] = flat[base + k] end
+                    return out
+                end
+            end
+        end
+    end
+    return flat
+end
+
+local function sameStroke(a, b)
+    if a.w ~= b.w or #a.p ~= #b.p then return false end
+    for k = 1, #a.p do
+        if a.p[k] ~= b.p[k] then return false end
+    end
+    return true
+end
+
+-- One-time v2 -> v3 repair: undouble strokes and drop back-to-back
+-- identical strokes (the doubled copy split off by the teleport splitter).
+function EpubStorage.repairDoubled(pages)
+    local fixed_strokes, dropped = 0, 0
+    for key, list in pairs(pages) do
+        local out = {}
+        for _, s in ipairs(list) do
+            local p = EpubStorage.undouble(s.p)
+            if p ~= s.p then
+                s.p = p
+                fixed_strokes = fixed_strokes + 1
+            end
+            if #out > 0 and sameStroke(out[#out], s) then
+                dropped = dropped + 1
+            else
+                table.insert(out, s)
+            end
+        end
+        pages[key] = out
+    end
+    return fixed_strokes, dropped
+end
+
 function EpubStorage:new(doc_path)
     local o = setmetatable({}, EpubStorage)
     o.doc_path = doc_path
     o.sidecar_dir = o:getSidecarDir(doc_path)
     o.file_path = o.sidecar_dir .. "/boox_stylus_annotations.lua"
     o.backup_path = o.sidecar_dir .. "/boox_stylus_annotations.v1.json.bak"
-    o.data = { version = EpubStorage.VERSION, pages = {} }
+    o.data = { version = EpubStorage.VERSION, pages = {}, anchored = {} }
     o.dirty = false
+    -- Bumped on every change to data.anchored (invalidates layout caches)
+    o.anchored_rev = 0
     o.save_cb = function() o:flush() end
     o:load()
     return o
@@ -162,11 +235,11 @@ local function writeFile(path, content)
 end
 
 function EpubStorage:load()
-    self.data = { version = EpubStorage.VERSION, pages = {} }
+    self.data = { version = EpubStorage.VERSION, pages = {}, anchored = {} }
     local content = readFile(self.file_path)
     if not content or content == "" then return end
 
-    -- v2: a Lua chunk, parsed by LuaJIT far faster than any JSON decoder
+    -- v2+: a Lua chunk, parsed by LuaJIT far faster than any JSON decoder
     if content:sub(1, 6) == "return" then
         local chunk = loadstring(content, "boox_stylus_annotations")
         if chunk then
@@ -174,7 +247,17 @@ function EpubStorage:load()
             if ok and type(res) == "table" and type(res.pages) == "table"
                     and (tonumber(res.version) or 0) >= 2 then
                 self.data = res
+                res.anchored = res.anchored or {}
                 logger.info("BooxPen: loaded annotations from " .. self.file_path)
+                if res.version < 3 then
+                    local fixed, dropped = EpubStorage.repairDoubled(res.pages)
+                    logger.info("BooxPen: repaired doubled strokes:", fixed, "undoubled,", dropped, "duplicates dropped")
+                end
+                if res.version < EpubStorage.VERSION then
+                    res.version = EpubStorage.VERSION
+                    self.dirty = true
+                    self:flush()
+                end
                 return
             end
         end
@@ -202,6 +285,8 @@ function EpubStorage:load()
     end
 
     self.data = EpubStorage.migrateV1(old)
+    self.data.anchored = {}
+    EpubStorage.repairDoubled(self.data.pages)
     -- Keep the original before the first v2 write
     if not lfs.attributes(self.backup_path, "mode") then
         local bok, berr = writeFile(self.backup_path, content)
@@ -216,8 +301,19 @@ function EpubStorage:load()
     self:flush()
 end
 
+local function serializeStroke(s)
+    local head = "{w=" .. tostring(s.w or 5) .. ",c=" .. tostring(s.c or 0)
+    if s.a then
+        head = head .. string.format(",a=%q,fs=%s", s.a, tostring(s.fs or 0))
+    end
+    return head .. ",p={" .. table.concat(s.p, ",") .. "}},\n"
+end
+
+-- Strokes per generated function: keeps every chunk's constant table small
+local CHUNK = 400
+
 function EpubStorage.serialize(data)
-    local out = { "return {version=", tostring(EpubStorage.VERSION), ",pages={\n" }
+    local out = { "return (function()\nlocal d={version=", tostring(EpubStorage.VERSION), ",pages={\n" }
     local n = #out
     local keys = {}
     for k in pairs(data.pages) do table.insert(keys, k) end
@@ -232,14 +328,22 @@ function EpubStorage.serialize(data)
             -- One function per page keeps each chunk's constant table small
             n = n + 1; out[n] = string.format("[%q]=(function() return {\n", tostring(k))
             for _, s in ipairs(list) do
-                n = n + 1
-                out[n] = "{w=" .. tostring(s.w or 5) .. ",c=" .. tostring(s.c or 0)
-                    .. ",p={" .. table.concat(s.p, ",") .. "}},\n"
+                n = n + 1; out[n] = serializeStroke(s)
             end
             n = n + 1; out[n] = "} end)(),\n"
         end
     end
-    n = n + 1; out[n] = "}}\n"
+    n = n + 1; out[n] = "}}\nlocal A={} d.anchored=A\n"
+        .. "local function add(t) for i=1,#t do A[#A+1]=t[i] end end\n"
+    local anchored = data.anchored or EMPTY
+    for i = 1, #anchored, CHUNK do
+        n = n + 1; out[n] = "add((function() return {\n"
+        for j = i, math.min(i + CHUNK - 1, #anchored) do
+            n = n + 1; out[n] = serializeStroke(anchored[j])
+        end
+        n = n + 1; out[n] = "} end)())\n"
+    end
+    n = n + 1; out[n] = "return d\nend)()\n"
     return table.concat(out)
 end
 
@@ -318,10 +422,60 @@ function EpubStorage:undo(page_num)
     end
 end
 
+-- Removes the page's strokes in `set` (stroke tables mapped to true)
+function EpubStorage:removeStrokes(page_num, set)
+    if not page_num then return end
+    local key = tostring(page_num)
+    local strokes = self.data.pages[key]
+    if not strokes then return end
+    local kept = {}
+    for _, s in ipairs(strokes) do
+        if not set[s] then table.insert(kept, s) end
+    end
+    if #kept ~= #strokes then
+        self.data.pages[key] = #kept > 0 and kept or nil
+        self:markDirty()
+    end
+end
+
 function EpubStorage:clearPage(page_num)
     if not page_num then return end
     self.data.pages[tostring(page_num)] = nil
     self:markDirty()
+end
+
+-- Removes and returns a page's screen-positioned strokes (for converting
+-- them to anchored strokes), or nil when there are none.
+function EpubStorage:takePage(page_num)
+    local key = tostring(page_num)
+    local list = self.data.pages[key]
+    if not list or #list == 0 then return nil end
+    self.data.pages[key] = nil
+    self:markDirty()
+    return list
+end
+
+function EpubStorage:getAnchored()
+    return self.data.anchored
+end
+
+function EpubStorage:addAnchored(stroke)
+    table.insert(self.data.anchored, stroke)
+    self.anchored_rev = self.anchored_rev + 1
+    self:markDirty()
+end
+
+-- `set` maps stroke tables to true
+function EpubStorage:removeAnchored(set)
+    local kept = {}
+    for _, s in ipairs(self.data.anchored) do
+        if not set[s] then table.insert(kept, s) end
+    end
+    if #kept ~= #self.data.anchored then
+        self.data.anchored = kept
+        self.anchored_rev = self.anchored_rev + 1
+        self:markDirty()
+    end
 end
 
 return EpubStorage
