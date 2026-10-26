@@ -91,6 +91,16 @@ local ERASER_REACH_PX = 12
 
 local EMPTY = {}
 
+-- Smallest {x, y, w, h} covering both regions; either may be nil.
+local function unionRegion(a, b)
+    if not a then return b end
+    if not b then return a end
+    local x0, y0 = math.min(a.x, b.x), math.min(a.y, b.y)
+    local x1 = math.max(a.x + a.w, b.x + b.w)
+    local y1 = math.max(a.y + a.h, b.y + b.h)
+    return { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+end
+
 -- Input hooks chain forever once registered, so they are installed once per
 -- process and act on whichever reader instance is currently active.
 local hooks_installed = false
@@ -622,13 +632,13 @@ function BooxPen:pollStrokes()
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
     local added = {}
-    local erased = false
+    local erased -- screen region covering everything the eraser removed
 
     for _, stroke in ipairs(strokes) do
         local pts = stroke.p
         if stroke.e then
-            if type(pts) == "table" and #pts >= 3 and self:eraseAlong(pts) then
-                erased = true
+            if type(pts) == "table" and #pts >= 3 then
+                erased = unionRegion(erased, self:eraseAlong(pts))
             end
         elseif type(pts) == "table" and #pts >= 3 then
             -- Normalize coordinates (0..1) so annotations scale across orientations/resolutions
@@ -674,18 +684,17 @@ function BooxPen:pollStrokes()
         end
     end
 
-    if erased and self.show_annotations then
-        -- Erased ink can sit anywhere under the eraser path; a full repaint
-        -- also wipes what the panel still shows of it.
-        self:refreshView()
-        return
+    -- Repaint and refresh only the area the new and erased strokes cover
+    -- (strokesBounds pads by the stroke width, which also wipes the panel's
+    -- copy of erased ink).
+    local region = erased
+    if #added > 0 then
+        region = unionRegion(region, Renderer.strokesBounds(added,
+            Renderer.screenTransform(screen_w, screen_h), screen_w, screen_h, self.ink_weight))
     end
-
-    -- Repaint and refresh only the area the new strokes cover
-    if #added > 0 and self.show_annotations then
-        local region = Renderer.strokesBounds(added, Renderer.screenTransform(screen_w, screen_h),
-            screen_w, screen_h, self.ink_weight)
-        logger.dbg("BooxPen:", #added, "strokes added, refreshing", region and region.w, region and region.h)
+    if region and self.show_annotations then
+        logger.dbg("BooxPen:", #added, "strokes added, erased", erased ~= nil,
+            "refreshing", region.w, region.h)
         self:refreshView(region)
     end
 end
@@ -712,23 +721,30 @@ local function strokeHit(stroke, tx, ex, ebox, reach)
 end
 
 -- Stroke eraser: deletes every visible stroke the eraser path (screen px,
--- flat {x,y,p,...}) passes over. Returns true when anything was removed.
+-- flat {x,y,p,...}) passes over. Returns the screen region the removed
+-- strokes covered, or nil when nothing was removed.
 function BooxPen:eraseAlong(ex)
-    if not self.storage then return false end
+    if not self.storage then return nil end
     local ebox = { Anchor.bbox(ex) }
     local removed = 0
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local region
 
     local page = self:getCurrentPageNumber()
-    local page_tx = Renderer.screenTransform(Screen:getWidth(), Screen:getHeight())
-    local set = {}
+    local page_tx = Renderer.screenTransform(screen_w, screen_h)
+    local set, hits = {}, {}
     for _, s in ipairs(self.storage:getStrokes(page)) do
         local reach = ERASER_REACH_PX + Renderer.pointWidth(s.w or 5, 1, self.ink_weight) / 2
         if strokeHit(s, page_tx, ex, ebox, reach) then
             set[s] = true
+            hits[#hits + 1] = s
             removed = removed + 1
         end
     end
-    if removed > 0 then self.storage:removeStrokes(page, set) end
+    if removed > 0 then
+        region = Renderer.strokesBounds(hits, page_tx, screen_w, screen_h, self.ink_weight)
+        self.storage:removeStrokes(page, set)
+    end
 
     if self.anchored_mode then
         local aset, n = {}, 0
@@ -738,6 +754,8 @@ function BooxPen:eraseAlong(ex)
             if strokeHit(s, it.tx, ex, ebox, reach) then
                 aset[s] = true
                 n = n + 1
+                region = unionRegion(region,
+                    Renderer.strokesBounds({ s }, it.tx, screen_w, screen_h, self.ink_weight))
             end
         end
         if n > 0 then
@@ -746,7 +764,7 @@ function BooxPen:eraseAlong(ex)
         end
     end
     logger.info("BooxPen: eraser removed", removed, "strokes")
-    return removed > 0
+    return region
 end
 
 function BooxPen:undo()

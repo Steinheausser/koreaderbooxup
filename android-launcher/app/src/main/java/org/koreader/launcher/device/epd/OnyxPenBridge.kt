@@ -79,16 +79,14 @@ object OnyxPenBridge {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // A/B switches, re-read at every session start so they can be flipped
-    // over adb without a rebuild (debug.* props need no root):
+    // A/B switch, re-read at every session start so it can be flipped over
+    // adb without a rebuild (debug.* props need no root):
     //   adb shell setprop debug.koreader.boox.notes_mode 1
-    //   adb shell setprop debug.koreader.boox.prime 0
     // notes_mode copies Onyx Notes (knote2, fw 2023-12): no enablePost toggling
     // per stroke; while a session is active, KOReader's refreshes go through
     // the firmware's handwritingRepaint (HANDWRITING_REPAINT -> SurfaceFlinger),
     // which the panel commits even while the handwriting scheme is active.
     @Volatile private var notesMode = false
-    private var primeEnabled = true
 
     private fun boolProp(name: String, default: Boolean): Boolean {
         return try {
@@ -424,8 +422,7 @@ object OnyxPenBridge {
             }
 
             notesMode = boolProp("debug.koreader.boox.notes_mode", false)
-            primeEnabled = boolProp("debug.koreader.boox.prime", true)
-            Log.i(TAG, "OnyxPenBridge: session flags notesMode=$notesMode prime=$primeEnabled")
+            Log.i(TAG, "OnyxPenBridge: session flags notesMode=$notesMode")
 
             try {
                 val helper = touchHelper ?: TouchHelper.create(surfaceView, true, callback).also {
@@ -487,7 +484,8 @@ object OnyxPenBridge {
                     // sent 1 and setRawDrawingEnabled(true) moved SurfaceFlinger
                     // on to 2 (EpdPenManager.startDrawing/resumeDrawing in
                     // onyxsdk-pen 1.3.6). Sending 1 here knocked it back to START,
-                    // the likely reason live ink needed the delayed prime.
+                    // which is why live ink used to need a delayed
+                    // startStroke "prime" (removed: instant with state 2).
                     EpdController.setScreenHandWritingPenState(surfaceView, 2)
                 } catch (e: Throwable) {
                     Log.e(TAG, "OnyxPenBridge: setScreenHandWritingPenState FAILED", e)
@@ -506,9 +504,6 @@ object OnyxPenBridge {
                     Log.i(TAG, "OnyxPenBridge: hardware stroke params set (BRUSH, w=$currentStrokeWidth)")
                 } catch (e: Throwable) {
                     Log.e(TAG, "OnyxPenBridge: setting hardware stroke params FAILED", e)
-                }
-                if (primeEnabled) {
-                    primeHardwarePen(surfaceView)
                 }
             } catch (e: Throwable) {
                 Log.e(TAG, "Error enabling drawing mode on SurfaceView", e)
@@ -547,35 +542,6 @@ object OnyxPenBridge {
             }
             Log.i(TAG, "OnyxPenBridge: Drawing mode DISABLED")
         }
-    }
-
-    /**
-     * Diagnostic + workaround restored verbatim: with this delayed
-     * startStroke-family call present, live ink works; without it, it does
-     * not (mechanism still under investigation — prime suspect is EPD pen
-     * width/state setup that only this API family performs on this
-     * firmware). Delayed past enable-time refreshes; remove once the
-     * minimal sufficient trigger is isolated.
-     */
-    private fun primeHardwarePen(surfaceView: SurfaceView) {
-        mainHandler.postDelayed({
-            try {
-                EpdController.setStrokeStyle(TouchHelper.STROKE_STYLE_BRUSH)
-                EpdController.setStrokeWidth(5f)
-                EpdController.setStrokeColor(Color.BLACK)
-                // Guess at arg order: x0, y0, x1, y1, pressure, width.
-                EpdController.startStroke(200f, 500f, 1400f, 600f, 1.0f, 5f)
-                EpdController.addStrokePoint(600f, 520f, 1000f, 560f, 1.0f, 5f)
-                EpdController.finishStroke(1000f, 560f, 1400f, 600f, 1.0f, 5f)
-                Log.i(TAG, "OnyxPenBridge: stroke-API test line issued")
-                // Restore the user's pen settings the prime overrode above
-                EpdController.setStrokeWidth(currentStrokeWidth)
-                EpdController.setStrokeColor(currentStrokeColor)
-                touchHelper?.setStrokeWidth(currentStrokeWidth)
-            } catch (e: Throwable) {
-                Log.e(TAG, "OnyxPenBridge: stroke-API test line FAILED", e)
-            }
-        }, 5000)
     }
 
     /**
