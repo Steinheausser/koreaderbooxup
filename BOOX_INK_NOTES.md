@@ -217,26 +217,61 @@ pen state `SET_SCREEN_HANDWRITING_PEN_STATE` 0 stop / 1 start / 2 drawing /
   mode `HAND_WRITING_REPAINT_MODE` (524290), which the panel commits while the
   handwriting scheme stays active. `View.handwritingRepaint(view,l,t,r,b)`
   exists on this firmware and is the same path.
-- A/B switches (read at each session enable; no rebuild needed):
-  - `adb shell setprop debug.koreader.boox.prime 0`: skip the delayed prime
-    stroke. Test first, now that the state is fixed.
-  - `adb shell setprop debug.koreader.boox.notes_mode 1`: no enter/leave
-    scribble on pen down/up; while a session is active, `einkUpdate` regions
-    go through `handwritingRepaint` instead of `refreshScreen`
-    (`OnyxPenBridge.routeRefresh`). Expect faster settle after lift and no
-    scheme-flip churn. Page turns while inking use the GU handwriting
-    waveform (no GC flash).
-  - Reset: set back to `1` / `0`, or reboot (debug props don't persist).
-  Check `logcat -s OnyxPenBridge` for `session flags notesMode=… prime=…`.
+### Results (2026-10-26/27, on-device)
 
-### Results (2026-10-26, on-device)
-
-- State 2 fix: live ink is instant, and stays instant with `prime 0`.
+- State 2 fix: live ink is instant without the prime; `primeHardwarePen`
+  is removed.
 - Wedge notches in the settled ink fixed by the capsule renderer
   (`drawCapsule`).
 - Stroke eraser: rubber end or side button (`enableSideBtnErase(true)`)
   queues the path as `{e=1,p=...}`; `BooxPen:eraseAlong` deletes visible
-  strokes within 12px (+ half width), then does a full refresh. Verified.
+  strokes within 12px (+ half width) and returns their bounds, so only that
+  area is refreshed (it used to repaint the whole screen).
+
+## Refresh path while inking: notes mode is the default (2026-10-27)
+
+Ground truth comes from the display HAL, not KOReader: `logcat | grep SDM`
+shows every real panel update (`update_to_display ... waveform_mode,
+update_mode, Rect, flags`), and `SWEpdcManager` logs scheme switches.
+
+- **Why everything flashed:** `OnyxEPDController` reports "full-only", so
+  KOReader's Android framebuffer (`ffi/framebuffer_android.lua`) sends only
+  *full* refreshes to `einkUpdate`; ui/partial/fast refreshes (stroke
+  repaints, menus, page turns) are left to the firmware. In the old per-stroke
+  model, pen-down entered scribble mode (`setEbcUpdateScheme 3`) and pen-up
+  left it (scheme 2), after which the firmware showed KOReader's next frame
+  as a **full-screen GC16** update (`waveform_mode = 2, update_mode = 1`):
+  one full flash per stroke, queueing up when writing fast. While the
+  handwriting scheme is active the firmware drops those refreshes entirely,
+  which is why the first notes-mode attempt "froze" the screen (KOReader kept
+  running; nothing reached the panel).
+- **Refresh hook (`installRefreshHook`, main.lua):** while inking, every
+  `refresh*Imp` region is also sent to `android.einkUpdate` with the
+  reserved mode `PEN_REPAINT_MODE` (0x40000000), which `MainActivity`
+  routes to `OnyxPenBridge.routeRefresh` only.
+- **Notes mode (default, `debug.koreader.boox.notes_mode 0` to disable):**
+  no enter/leave scribble per stroke; `routeRefresh` sends regions through
+  `EpdController.handwritingRepaint`, which the panel commits during the
+  handwriting scheme (`waveform_mode = 2, update_mode = 0`, flag 0x80000,
+  region only). It is the only path that works: `View.refreshScreen` with
+  the handwrite flag (REGAL 0x80006) is dropped, so page turns while inking
+  are full-page GC16 (slow, one flash). Leaving the scheme instead triggers
+  the firmware's own full GC16 clean-up, so there is nothing faster to fall
+  back to.
+- **Pen-up refresh (`PEN_UP_REFRESH_DELAY` 0.5s, like Notes' default):** new
+  and erased ink is stored at once but pushed to the panel only once the pen
+  has rested, as one update over the union of the burst. Live hardware ink
+  covers the gap. A panel update per stroke stacked GC16 updates and
+  repainted the area next to the letter being written.
+- **Settled ink weight** now defaults to "Same as live ink" (1.0; was 1.2),
+  with a new "Thinner" (0.8) option. The vector render was correct; 1.2x
+  plus the pressure multiplier simply read as much bolder than live ink.
+- **USB:** this unit's cable/port corrupts adb pushes (1–2 flipped bytes per
+  36MB APK, pulls are clean), so `adb install` fails v2 signature checks.
+  Push in hash-verified chunks, `cat` them together on the device, then
+  `pm install -r` the local file.
+- Builds: `scripts\build_apk.ps1` breaks on the `&` in the folder path and on
+  JDK 27; build through an `&`-free junction with JDK 21 instead.
 
 ## Doubled strokes + text-anchored ink (2026-10-03, on-device)
 

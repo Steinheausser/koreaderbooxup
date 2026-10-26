@@ -29,6 +29,11 @@ import java.util.concurrent.ConcurrentLinkedQueue
 object OnyxPenBridge {
     private const val TAG = "OnyxPenBridge"
 
+    // einkUpdate mode the boox_pen plugin uses to hand over the regions of
+    // KOReader's ui/partial/fast refreshes while inking (Onyx is "full-only",
+    // so those never reach einkUpdate otherwise). Must match main.lua.
+    const val PEN_REPAINT_MODE = 0x40000000
+
     private var touchHelper: TouchHelper? = null
     private var isDrawingActive = false
 
@@ -79,14 +84,16 @@ object OnyxPenBridge {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // A/B switch, re-read at every session start so it can be flipped over
-    // adb without a rebuild (debug.* props need no root):
-    //   adb shell setprop debug.koreader.boox.notes_mode 1
-    // notes_mode copies Onyx Notes (knote2, fw 2023-12): no enablePost toggling
-    // per stroke; while a session is active, KOReader's refreshes go through
-    // the firmware's handwritingRepaint (HANDWRITING_REPAINT -> SurfaceFlinger),
-    // which the panel commits even while the handwriting scheme is active.
-    @Volatile private var notesMode = false
+    // Notes mode (default) copies Onyx Notes (knote2, fw 2023-12): no
+    // enablePost toggling per stroke; while a session is active, KOReader's
+    // refreshes go through the firmware's handwritingRepaint
+    // (HANDWRITING_REPAINT -> SurfaceFlinger, always GC16), the only update
+    // the panel commits while the handwriting scheme is active
+    // (View.refreshScreen with the handwrite flag, e.g. REGAL 0x80006, is
+    // dropped). Re-read at every session start; to fall back to toggling
+    // scribble mode per stroke without a rebuild:
+    //   adb shell setprop debug.koreader.boox.notes_mode 0
+    @Volatile private var notesMode = true
 
     private fun boolProp(name: String, default: Boolean): Boolean {
         return try {
@@ -421,7 +428,7 @@ object OnyxPenBridge {
                 return
             }
 
-            notesMode = boolProp("debug.koreader.boox.notes_mode", false)
+            notesMode = boolProp("debug.koreader.boox.notes_mode", true)
             Log.i(TAG, "OnyxPenBridge: session flags notesMode=$notesMode")
 
             try {
@@ -567,8 +574,7 @@ object OnyxPenBridge {
     }
 
     /**
-     * Notes mode only: sends an eink refresh request as a handwriting repaint
-     * (what Notes' PartialRefreshRequest does via HAND_WRITING_REPAINT_MODE),
+     * Notes mode only: sends an eink refresh request as a handwriting repaint,
      * so it reaches the panel while the handwriting scheme is active.
      * Coordinates are relative to [view], like View.refreshScreen. A zero-size
      * region means the whole view. Returns false when the caller should use
@@ -583,6 +589,7 @@ object OnyxPenBridge {
         val bottom = if (full) view.height else y + height
         mainHandler.postDelayed({
             try {
+                Log.d(TAG, "handwritingRepaint [$left,$top,$right,$bottom]")
                 EpdController.handwritingRepaint(view, left, top, right, bottom)
             } catch (e: Throwable) {
                 Log.e(TAG, "OnyxPenBridge: handwritingRepaint FAILED", e)

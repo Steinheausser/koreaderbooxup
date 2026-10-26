@@ -29,7 +29,7 @@ local BooxPen = WidgetContainer:extend{
     is_drawing_active = false,
     pen_width = 5,
     pen_color = 0, -- KOReader gray, 0 = black (converted to ARGB natively)
-    ink_weight = 1.2,
+    ink_weight = 1.0,
     show_annotations = true,
     storage = nil,
     poll_timer = nil,
@@ -50,6 +50,7 @@ local PEN_WIDTHS = {
 }
 -- Settled ink thickness relative to live ink
 local INK_WEIGHTS = {
+    { text = _("Thinner"), weight = 0.8 },
     { text = _("Same as live ink"), weight = 1.0 },
     { text = _("Slightly bolder"), weight = 1.2 },
     { text = _("Bolder"), weight = 1.5 },
@@ -88,6 +89,8 @@ local ANCHOR_GROUP_MAX_H = 260
 -- The eraser deletes strokes passing within this many px of its path
 -- (plus half the stroke's width)
 local ERASER_REACH_PX = 12
+-- Seconds the pen must rest before new ink is pushed to the panel
+local PEN_UP_REFRESH_DELAY = 0.5
 
 local EMPTY = {}
 
@@ -108,6 +111,47 @@ local active_instance = nil
 local contact_state = {}
 local contact_slot = 0
 
+-- KOReader's Android framebuffer sends only full refreshes to the Onyx EPD
+-- ("full-only" mode, ffi/framebuffer_android.lua); ui/partial/fast ones are
+-- left to the firmware, which flashes the whole screen in GC16 and, while the
+-- handwriting scheme is active, drops them altogether. While inking, every
+-- refresh region is also handed to the pen bridge under this mode value,
+-- which only MainActivity.einkUpdate understands (OnyxPenBridge.PEN_REPAINT_MODE;
+-- it acts on it in notes mode only).
+local PEN_REPAINT_MODE = 0x40000000
+local REFRESH_IMPS = {
+    "refreshPartialImp", "refreshFlashPartialImp",
+    "refreshUIImp", "refreshFlashUIImp", "refreshFastImp",
+}
+local refresh_hook_installed = false
+
+local function installRefreshHook()
+    if refresh_hook_installed then return end
+    local a = getAndroid()
+    if not (a and a.einkUpdate) then return end
+    for _, name in ipairs(REFRESH_IMPS) do
+        local orig = Screen[name]
+        if type(orig) == "function" then
+            Screen[name] = function(fb, x, y, w, h)
+                orig(fb, x, y, w, h)
+                local plugin_self = active_instance
+                if not (plugin_self and plugin_self.is_drawing_active) then return end
+                local bb = fb.full_bb or fb.bb
+                if not (x and y and w and h) then
+                    x, y, w, h = 0, 0, fb:getWidth(), fb:getHeight()
+                end
+                x, y, w, h = bb:getBoundedRect(x, y, w, h)
+                x, y, w, h = bb:getPhysicalRect(x, y, w, h)
+                if w > 0 and h > 0 then
+                    pcall(a.einkUpdate, PEN_REPAINT_MODE, 0, x, y, w, h)
+                end
+            end
+        end
+    end
+    refresh_hook_installed = true
+    logger.info("BooxPen: pen refresh hook installed")
+end
+
 function BooxPen:init()
     -- Reader only: the file manager has no document to annotate
     if not self.ui or not self.ui.document then return end
@@ -121,10 +165,11 @@ function BooxPen:init()
     end
     self.ui.menu:registerToMainMenu(self)
     self:setupGestureSuppression()
+    installRefreshHook()
     local auto_enable = G_reader_settings:readSetting("boox_pen_auto_enable")
     self.auto_enable_drawing = (auto_enable == nil) or (auto_enable == true)
     self.pen_width = G_reader_settings:readSetting("boox_pen_width") or 5
-    self.ink_weight = G_reader_settings:readSetting("boox_pen_ink_weight") or 1.2
+    self.ink_weight = G_reader_settings:readSetting("boox_pen_ink_weight") or 1.0
     self.show_annotations = G_reader_settings:nilOrTrue("boox_pen_show_annotations")
 end
 
@@ -286,6 +331,10 @@ function BooxPen:onCloseDocument()
     if self:isInert() then return end
     self.pending_auto_enable = false
     self:setDrawingMode(false, true)
+    if self.pen_up_refresh then
+        UIManager:unschedule(self.pen_up_refresh)
+    end
+    self.pending_refresh = nil
     if self.storage then
         self.storage:close()
         self.storage = nil
@@ -557,6 +606,7 @@ function BooxPen:setDrawingMode(enable, silent, force)
         self:stopPolling()
         -- Drain remaining strokes before disabling
         self:pollStrokes()
+        self:flushPenUpRefresh(true)
         a.booxSetDrawingMode(false, "[]")
         if not silent then
             UIManager:show(require("ui/widget/notification"):new{
@@ -587,6 +637,36 @@ function BooxPen:stopPolling()
         UIManager:unschedule(self.poll_timer)
         self.poll_timer = nil
     end
+end
+
+-- Pen-up refresh, as in Onyx Notes (500 ms default): new and erased ink is
+-- pushed to the panel once the pen has rested, as one update over the union
+-- of everything written meanwhile. Live hardware ink covers the gap; a panel
+-- update per stroke cost time and repainted the area next to the letter
+-- being written.
+function BooxPen:schedulePenUpRefresh()
+    if not self.pen_up_refresh then
+        self.pen_up_refresh = function() self:flushPenUpRefresh() end
+    end
+    UIManager:unschedule(self.pen_up_refresh)
+    UIManager:scheduleIn(PEN_UP_REFRESH_DELAY, self.pen_up_refresh)
+end
+
+-- force: refresh now even if the pen is still active (session ending)
+function BooxPen:flushPenUpRefresh(force)
+    if self.pen_up_refresh then
+        UIManager:unschedule(self.pen_up_refresh)
+    end
+    local region = self.pending_refresh
+    if not region then return end
+    if not force and self:isPenActive() then
+        -- Still writing: wait for the pen to rest
+        self:schedulePenUpRefresh()
+        return
+    end
+    self.pending_refresh = nil
+    logger.dbg("BooxPen: pen-up refresh", region.x, region.y, region.w, region.h)
+    self:refreshView(region)
 end
 
 -- Decodes the native stroke batch into { {w=, p={x,y,p,...}}, ... } in
@@ -694,8 +774,9 @@ function BooxPen:pollStrokes()
     end
     if region and self.show_annotations then
         logger.dbg("BooxPen:", #added, "strokes added, erased", erased ~= nil,
-            "refreshing", region.w, region.h)
-        self:refreshView(region)
+            "pending refresh", region.w, region.h)
+        self.pending_refresh = unionRegion(self.pending_refresh, region)
+        self:schedulePenUpRefresh()
     end
 end
 
