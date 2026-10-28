@@ -612,9 +612,9 @@ object OnyxPenBridge {
      */
     fun setPenColor(color: Int) {
         currentStrokeColor = if (color in 0..255) Color.rgb(color, color, color) else color
-        touchHelper?.setStrokeColor(color)
+        touchHelper?.setStrokeColor(currentStrokeColor)
         try {
-            EpdController.setStrokeColor(color)
+            EpdController.setStrokeColor(currentStrokeColor)
         } catch (_: Throwable) {}
     }
 
