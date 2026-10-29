@@ -1,4 +1,5 @@
 local BlitBuffer = require("ffi/blitbuffer")
+local ffi = require("ffi")
 
 local floor = math.floor
 local sqrt = math.sqrt
@@ -37,11 +38,50 @@ function Renderer.pointWidth(w, p, weight)
     return min(MAX_WIDTH, max(MIN_WIDTH, w * (weight or 1) * mult))
 end
 
--- Filled disc of diameter d centered at (cx, cy), as horizontal spans.
-function Renderer.drawDisc(bb, cx, cy, d, color)
+-- All shapes are drawn as horizontal spans through a fill(x, y, w)
+-- callback, so the same code paints either a screen blitbuffer
+-- (spanFiller) or the cached ink mask (maskFiller).
+
+-- Span callback painting `color` into any blitbuffer
+function Renderer.spanFiller(bb, color)
+    return function(x, y, w)
+        bb:paintRect(x, y, w, 1, color)
+    end
+end
+
+-- Span callback writing full coverage (0xFF) straight into an unrotated BB8
+-- mask: one clipped ffi.fill per span, no blitbuffer call overhead. Also
+-- tracks the bounding box of everything painted; filler.box() returns it
+-- as x0, y0, x1, y1 (exclusive) or nil when nothing was painted.
+function Renderer.maskFiller(mask)
+    local data = ffi.cast("uint8_t*", mask.data)
+    local stride = mask.stride
+    local mw, mh = mask.w, mask.h
+    local bx0, by0, bx1, by1 = math.huge, math.huge, -math.huge, -math.huge
+    local fill = function(x, y, w)
+        if y < 0 or y >= mh then return end
+        local xe = x + w
+        if x < 0 then x = 0 end
+        if xe > mw then xe = mw end
+        if xe <= x then return end
+        ffi.fill(data + y * stride + x, xe - x, 0xFF)
+        if x < bx0 then bx0 = x end
+        if xe > bx1 then bx1 = xe end
+        if y < by0 then by0 = y end
+        if y >= by1 then by1 = y + 1 end
+    end
+    local box = function()
+        if bx0 > bx1 then return nil end
+        return bx0, by0, bx1, by1
+    end
+    return fill, box
+end
+
+-- Filled disc of diameter d centered at (cx, cy).
+local function fillDisc(fill, cx, cy, d)
     local r = d / 2
     if r <= 0.75 then
-        bb:paintRect(floor(cx), floor(cy), 1, 1, color)
+        fill(floor(cx), floor(cy), 1)
         return
     end
     local r2 = r * r
@@ -51,7 +91,7 @@ function Renderer.drawDisc(bb, cx, cy, d, color)
         local x0 = round(cx - hw)
         local x1 = round(cx + hw)
         if x1 <= x0 then x1 = x0 + 1 end
-        bb:paintRect(x0, yy, x1 - x0, 1, color)
+        fill(x0, yy, x1 - x0)
     end
 end
 
@@ -59,12 +99,12 @@ end
 -- A capsule is convex, so each row is a single span (union of the two end
 -- discs and the body band), and consecutive capsules share their end disc,
 -- so joints are round at any angle: no notches, no cap bookkeeping.
-function Renderer.drawCapsule(bb, x0, y0, x1, y1, r, color)
+local function fillCapsule(fill, x0, y0, x1, y1, r)
     if r < MIN_RADIUS then r = MIN_RADIUS end
     local dx, dy = x1 - x0, y1 - y0
     local len = sqrt(dx * dx + dy * dy)
     if len < 0.5 then
-        Renderer.drawDisc(bb, x1, y1, 2 * r, color)
+        fillDisc(fill, x1, y1, 2 * r)
         return
     end
     local ux, uy = dx / len, dy / len
@@ -114,9 +154,17 @@ function Renderer.drawCapsule(bb, x0, y0, x1, y1, r, color)
                 c0 = floor((xa + xb) / 2)
                 c1 = c0
             end
-            bb:paintRect(c0, row, c1 - c0 + 1, 1, color)
+            fill(c0, row, c1 - c0 + 1)
         end
     end
+end
+
+function Renderer.drawDisc(bb, cx, cy, d, color)
+    fillDisc(Renderer.spanFiller(bb, color), cx, cy, d)
+end
+
+function Renderer.drawCapsule(bb, x0, y0, x1, y1, r, color)
+    fillCapsule(Renderer.spanFiller(bb, color), x0, y0, x1, y1, r)
 end
 
 -- Point transform: screen = (o + v * s) per axis. Screen-normalized strokes
@@ -128,10 +176,14 @@ end
 
 -- stroke = { w = pen width, c = gray, p = {x,y,p, ...} }
 function Renderer.renderStroke(bb, stroke, tx, weight)
+    Renderer.fillStroke(Renderer.spanFiller(bb, toColor(stroke.c or 0)), stroke, tx, weight)
+end
+
+-- Same as renderStroke, through a span callback (see maskFiller)
+function Renderer.fillStroke(fill, stroke, tx, weight)
     local pts = stroke.p
     if not pts or #pts < 3 then return end
     local base_w = stroke.w or 5
-    local color = toColor(stroke.c or 0)
     local n = floor(#pts / 3)
 
     local sx, sy, ox, oy = tx.sx, tx.sy, tx.ox, tx.oy
@@ -149,7 +201,7 @@ function Renderer.renderStroke(bb, stroke, tx, weight)
         if dx * dx + dy * dy >= 0.25 then
             -- Radius = half the mean width of the two ends; segments are
             -- only a few px long, so pressure still tapers smoothly.
-            Renderer.drawCapsule(bb, px, py, x, y, (pw + w) / 4, color)
+            fillCapsule(fill, px, py, x, y, (pw + w) / 4)
             drew = true
             px, py, pw = x, y, w
         else
@@ -157,8 +209,39 @@ function Renderer.renderStroke(bb, stroke, tx, weight)
         end
     end
     if not drew then
-        Renderer.drawDisc(bb, px, py, pw, color)
+        fillDisc(fill, px, py, pw)
     end
+end
+
+-- Bounding box {x0, y0, x1, y1} of a stroke's points in its own coordinate
+-- space (normalized for page strokes, anchor offsets for anchored ones).
+-- Memoized on the stroke as `_b`; the storage serializer never writes it.
+function Renderer.strokeBox(stroke)
+    local b = stroke._b
+    if b then return b end
+    local pts = stroke.p
+    local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+    for j = 1, #pts - 2, 3 do
+        local x, y = pts[j], pts[j + 1]
+        if x < x0 then x0 = x end
+        if x > x1 then x1 = x end
+        if y < y0 then y0 = y end
+        if y > y1 then y1 = y end
+    end
+    b = { x0, y0, x1, y1 }
+    stroke._b = b
+    return b
+end
+
+-- Screen-space box {x0, y0, x1, y1} of a stroke drawn with transform tx,
+-- grown by `pad` px on every side.
+function Renderer.screenBox(stroke, tx, pad)
+    local b = Renderer.strokeBox(stroke)
+    pad = pad or 0
+    return {
+        tx.ox + b[1] * tx.sx - pad, tx.oy + b[2] * tx.sy - pad,
+        tx.ox + b[3] * tx.sx + pad, tx.oy + b[4] * tx.sy + pad,
+    }
 end
 
 function Renderer.renderPageStrokes(bb, strokes, tx, weight)

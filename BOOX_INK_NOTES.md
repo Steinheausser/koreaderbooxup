@@ -295,3 +295,44 @@ update_mode, Rect, flags`), and `SWEpdcManager` logs scheme switches.
   screen is the one they were written in). PDFs keep screen-relative coords.
 - Verified: 42 legacy strokes on a dual-page portrait spread converted in
   ~45ms; screenshot diff vs. before conversion ~340 px (rounding only).
+
+## Ink performance: cached layer, direct pen-up, journal (2026-10-29, on-device)
+
+Modelled on Onyx Notes/NeoReader (one transparent ink bitmap per page, only
+the new stroke drawn at pen-up, incremental saves). Measured with the
+in-plugin benchmark (`setprop debug.koreader.boox.perf 1` and
+`debug.koreader.boox.bench 40`, test docs under `/sdcard/koreader/inktest/`
+only), synthetic page = 800 strokes x 25 points; real books have far less
+(largest real sidecar: 106 strokes, ~43 points each).
+
+- **Cached ink layer (`ink_layer.lua`):** one BB8 coverage mask per ink
+  colour, composited with `colorblitFrom` (C, the glyph path). LRU of 3
+  views keyed by page + screen size + ink weight (+ layout hash / scroll
+  position when anchored). Masks are filled with direct `ffi.fill` spans
+  (`Renderer.maskFiller`), no `paintRect` per row. Repaint with ink: 45-90ms
+  of Lua redraw -> ~20ms composite (constant in ink amount); first view of a
+  page builds the layer once (~90ms for 800 strokes).
+- **Direct pen-up:** new ink is drawn into the layer at ingest; the pen-up
+  refresh composites just the new strokes' box onto `Screen.bb` and does a
+  refresh-only `setDirty(nil, "ui", region)`. No ReaderUI repaint, so no
+  crengine re-render. Per burst: 40-130ms -> 0.2-0.5ms. Falls back to the
+  full repaint after an erase or when any window is above the reader.
+- **Local erase/undo:** clear the removed strokes' box in the layer and
+  redraw only the strokes overlapping it (`repairInk`, 1.5-2.5ms); per-stroke
+  bounding boxes (`Renderer.strokeBox`, memoized as `_b`) also prefilter the
+  eraser hit test.
+- **Anchors:** positions cached per xpointer per layout, filled lazily; a new
+  stroke no longer re-resolves every anchored stroke in the book (that cost
+  turned out to be small: 2ms for 400 anchors).
+- **Storage v5 + journal:** strokes get ids; each change appends one line to
+  `boox_stylus_annotations.journal` (`S`/`A` add, `R{ids}` remove, `C` clear;
+  <1ms), and the snapshot is rewritten only on close or when a journal is
+  found on load. Replay is idempotent (verified on-device by replaying over a
+  snapshot that already held the ops). Old cost: a full-book rewrite every
+  3s while writing (30-50ms on the test books). Snapshot pages are now split
+  into 400-stroke functions (LuaJIT constant limits). Offline tests: 24 pass.
+- `setprop debug.koreader.boox.ink_cache 0` restores the uncached renderer
+  for A/B (read at plugin load: restart KOReader).
+- Still open: the firmware turns every `handwritingRepaint` into a
+  full-panel GC16 partial update (`SDM ... Rect[0 0 2200 1650]`), whatever
+  region is requested.

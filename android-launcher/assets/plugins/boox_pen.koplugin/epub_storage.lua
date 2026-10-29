@@ -11,15 +11,21 @@ EpubStorage.__index = EpubStorage
 -- same layout with doubled strokes repaired (see repairDoubled); v4 adds
 -- `anchored`: reflowable-document strokes tied to a text position
 -- ({w, c, a = xpointer, fs = font size at capture, p = {dx,dy,p,...}} with
--- offsets in px from the anchor at that font size).
-EpubStorage.VERSION = 4
+-- offsets in px from the anchor at that font size); v5 gives every stroke a
+-- unique `id` (with `next_id` in the snapshot) so the journal can refer to
+-- strokes.
+--
+-- Changes are not written by re-serializing the whole book: each one is
+-- appended as one line to a journal next to the snapshot (S/A add a page /
+-- anchored stroke, R{ids} removes, C(page) clears a page), and the snapshot is only rewritten (compacted) on close, or on
+-- load when a journal is left over. Replaying is idempotent (strokes are
+-- added only if their id is new), so a crash between writing the new
+-- snapshot and deleting the journal loses nothing.
+EpubStorage.VERSION = 5
 
 -- Normalized gap above which one point list is split into segments.
 -- Must match the capture-time splitter in main.lua (STROKE_SPLIT_GAP).
 EpubStorage.SPLIT_GAP = 0.05
-
--- Seconds of inactivity before pending changes are written out
-EpubStorage.SAVE_DELAY = 3
 
 local EMPTY = {}
 
@@ -139,17 +145,30 @@ function EpubStorage.repairDoubled(pages)
     return fixed_strokes, dropped
 end
 
+-- Loads `src` as a chunk running in `env` (LuaJIT: setfenv; Lua 5.2+: load).
+local function loadWithEnv(src, name, env)
+    if setfenv then -- luacheck: ignore
+        local chunk = loadstring(src, name)
+        if not chunk then return nil end
+        setfenv(chunk, env) -- luacheck: ignore
+        return chunk
+    end
+    return load(src, name, "t", env)
+end
+
 function EpubStorage:new(doc_path)
     local o = setmetatable({}, EpubStorage)
     o.doc_path = doc_path
     o.sidecar_dir = o:getSidecarDir(doc_path)
     o.file_path = o.sidecar_dir .. "/boox_stylus_annotations.lua"
+    o.journal_path = o.sidecar_dir .. "/boox_stylus_annotations.journal"
     o.backup_path = o.sidecar_dir .. "/boox_stylus_annotations.v1.json.bak"
-    o.data = { version = EpubStorage.VERSION, pages = {}, anchored = {} }
+    o.data = { version = EpubStorage.VERSION, next_id = 1, pages = {}, anchored = {} }
+    o.by_id = {}
+    -- True while the snapshot is behind (changes only in the journal)
     o.dirty = false
-    -- Bumped on every change to data.anchored (invalidates layout caches)
+    -- Bumped on every change to data.anchored
     o.anchored_rev = 0
-    o.save_cb = function() o:flush() end
     o:load()
     return o
 end
@@ -234,8 +253,24 @@ local function writeFile(path, content)
     return true
 end
 
+-- Snapshot, then journal; compacts when anything had to be upgraded or
+-- replayed.
 function EpubStorage:load()
-    self.data = { version = EpubStorage.VERSION, pages = {}, anchored = {} }
+    self.data = { version = EpubStorage.VERSION, next_id = 1, pages = {}, anchored = {} }
+    self.by_id = {}
+    self:loadSnapshot()
+    if self.read_only then return end
+    self:indexIds()
+    if self:replayJournal() > 0 then
+        logger.info("BooxPen: replayed annotation journal for " .. self.file_path)
+        self.dirty = true
+    end
+    if self.dirty then
+        self:compact()
+    end
+end
+
+function EpubStorage:loadSnapshot()
     local content = readFile(self.file_path)
     if not content or content == "" then return end
 
@@ -256,7 +291,6 @@ function EpubStorage:load()
                 if res.version < EpubStorage.VERSION then
                     res.version = EpubStorage.VERSION
                     self.dirty = true
-                    self:flush()
                 end
                 return
             end
@@ -298,48 +332,184 @@ function EpubStorage:load()
     end
     logger.info("BooxPen: migrated v1 annotations to v2 for " .. self.file_path)
     self.dirty = true
-    self:flush()
+end
+
+local function sortedPageKeys(pages)
+    local keys = {}
+    for k in pairs(pages) do table.insert(keys, k) end
+    table.sort(keys, function(a, b)
+        local na, nb = tonumber(a), tonumber(b)
+        if na and nb then return na < nb end
+        return tostring(a) < tostring(b)
+    end)
+    return keys
+end
+
+-- Builds the id index, giving id-less (pre-v5) or duplicate strokes new ids.
+-- Assignment order is deterministic (sorted pages, then anchored), so even
+-- if the upgraded snapshot cannot be written, the next load hands out the
+-- same ids again and the journal still refers to the right strokes.
+function EpubStorage:indexIds()
+    local d = self.data
+    d.pages = d.pages or {}
+    d.anchored = d.anchored or {}
+    local max_id = 0
+    local function scan(s)
+        if type(s.id) == "number" and s.id > max_id then max_id = s.id end
+    end
+    for _, list in pairs(d.pages) do for _, s in ipairs(list) do scan(s) end end
+    for _, s in ipairs(d.anchored) do scan(s) end
+    local next_id = math.max(tonumber(d.next_id) or 1, max_id + 1)
+    local by_id = {}
+    local function take(s, key)
+        if type(s.id) ~= "number" or by_id[s.id] then
+            s.id = next_id
+            next_id = next_id + 1
+            self.dirty = true
+        end
+        s._k = key
+        by_id[s.id] = s
+    end
+    for _, key in ipairs(sortedPageKeys(d.pages)) do
+        for _, s in ipairs(d.pages[key]) do take(s, key) end
+    end
+    for _, s in ipairs(d.anchored) do take(s, nil) end
+    d.next_id = next_id
+    self.by_id = by_id
+end
+
+-- Applies a stroke add: page stroke when `key` is given, anchored otherwise.
+-- Ignored when the id is already present (journal replay is idempotent).
+function EpubStorage:applyAdd(key, s)
+    if type(s) ~= "table" or type(s.id) ~= "number" or type(s.p) ~= "table" then return end
+    if self.by_id[s.id] then return end
+    self.by_id[s.id] = s
+    if s.id >= self.data.next_id then self.data.next_id = s.id + 1 end
+    s._k = key
+    if key then
+        local list = self.data.pages[key]
+        if not list then
+            list = {}
+            self.data.pages[key] = list
+        end
+        list[#list + 1] = s
+    else
+        local list = self.data.anchored
+        list[#list + 1] = s
+        self.anchored_rev = self.anchored_rev + 1
+    end
+end
+
+-- Removes the strokes with the given ids (unknown ids are ignored).
+function EpubStorage:applyRemove(ids)
+    local set, pages_hit, anchored_hit = {}, {}, false
+    for _, id in ipairs(ids) do
+        local s = self.by_id[id]
+        if s then
+            set[s] = true
+            self.by_id[id] = nil
+            if s._k then pages_hit[s._k] = true else anchored_hit = true end
+        end
+    end
+    for key in pairs(pages_hit) do
+        local kept = {}
+        for _, s in ipairs(self.data.pages[key] or EMPTY) do
+            if not set[s] then kept[#kept + 1] = s end
+        end
+        self.data.pages[key] = #kept > 0 and kept or nil
+    end
+    if anchored_hit then
+        local kept = {}
+        for _, s in ipairs(self.data.anchored) do
+            if not set[s] then kept[#kept + 1] = s end
+        end
+        self.data.anchored = kept
+        self.anchored_rev = self.anchored_rev + 1
+    end
+end
+
+function EpubStorage:applyClear(key)
+    for _, s in ipairs(self.data.pages[key] or EMPTY) do
+        self.by_id[s.id] = nil
+    end
+    self.data.pages[key] = nil
+end
+
+-- Journal lines (ops) per replayed chunk
+local JOURNAL_BATCH = 100
+
+-- Replays the journal onto the loaded snapshot. Returns the number of ops.
+function EpubStorage:replayJournal()
+    local content = readFile(self.journal_path)
+    if not content or content == "" then return 0 end
+    local ops = 0
+    local env = {
+        S = function(key, s) ops = ops + 1; self:applyAdd(tostring(key), s) end,
+        A = function(s) ops = ops + 1; self:applyAdd(nil, s) end,
+        R = function(ids) ops = ops + 1; if type(ids) == "table" then self:applyRemove(ids) end end,
+        C = function(key) ops = ops + 1; self:applyClear(tostring(key)) end,
+    }
+    local function run(src)
+        local chunk = loadWithEnv(src, "boox_stylus_journal", env)
+        return chunk ~= nil and pcall(chunk)
+    end
+    -- Batches of lines keep each chunk well inside LuaJIT's per-function
+    -- constant limits. A line torn by a crash mid-append breaks its batch:
+    -- that batch is redone line by line, skipping what does not parse (ops
+    -- are idempotent, so anything the failed pass applied is harmless).
+    local lines = {}
+    for line in content:gmatch("[^\n]+") do lines[#lines + 1] = line end
+    local damaged = false
+    for i = 1, #lines, JOURNAL_BATCH do
+        local batch = table.concat(lines, "\n", i, math.min(i + JOURNAL_BATCH - 1, #lines))
+        if not run(batch) then
+            damaged = true
+            for j = i, math.min(i + JOURNAL_BATCH - 1, #lines) do run(lines[j]) end
+        end
+    end
+    if damaged then
+        logger.warn("BooxPen: skipped damaged lines in annotation journal " .. self.journal_path)
+    end
+    return ops
 end
 
 local function serializeStroke(s)
-    local head = "{w=" .. tostring(s.w or 5) .. ",c=" .. tostring(s.c or 0)
+    local head = "{id=" .. tostring(s.id) .. ",w=" .. tostring(s.w or 5) .. ",c=" .. tostring(s.c or 0)
     if s.a then
         head = head .. string.format(",a=%q,fs=%s", s.a, tostring(s.fs or 0))
     end
-    return head .. ",p={" .. table.concat(s.p, ",") .. "}},\n"
+    return head .. ",p={" .. table.concat(s.p, ",") .. "}}"
 end
 
 -- Strokes per generated function: keeps every chunk's constant table small
 local CHUNK = 400
 
 function EpubStorage.serialize(data)
-    local out = { "return (function()\nlocal d={version=", tostring(EpubStorage.VERSION), ",pages={\n" }
+    local out = { "return (function()\nlocal P={}\nlocal d={version=", tostring(EpubStorage.VERSION),
+        ",next_id=", tostring(data.next_id or 1), ",pages=P}\n",
+        "local function addp(k,t) local l=P[k] if not l then l={} P[k]=l end ",
+        "for i=1,#t do l[#l+1]=t[i] end end\n" }
     local n = #out
-    local keys = {}
-    for k in pairs(data.pages) do table.insert(keys, k) end
-    table.sort(keys, function(a, b)
-        local na, nb = tonumber(a), tonumber(b)
-        if na and nb then return na < nb end
-        return tostring(a) < tostring(b)
-    end)
-    for _, k in ipairs(keys) do
+    for _, k in ipairs(sortedPageKeys(data.pages)) do
         local list = data.pages[k]
-        if type(list) == "table" and #list > 0 then
-            -- One function per page keeps each chunk's constant table small
-            n = n + 1; out[n] = string.format("[%q]=(function() return {\n", tostring(k))
-            for _, s in ipairs(list) do
-                n = n + 1; out[n] = serializeStroke(s)
+        if type(list) == "table" then
+            -- At most CHUNK strokes per function, even on heavily inked pages
+            for i = 1, #list, CHUNK do
+                n = n + 1; out[n] = string.format("addp(%q,(function() return {\n", tostring(k))
+                for j = i, math.min(i + CHUNK - 1, #list) do
+                    n = n + 1; out[n] = serializeStroke(list[j]) .. ",\n"
+                end
+                n = n + 1; out[n] = "} end)())\n"
             end
-            n = n + 1; out[n] = "} end)(),\n"
         end
     end
-    n = n + 1; out[n] = "}}\nlocal A={} d.anchored=A\n"
+    n = n + 1; out[n] = "local A={} d.anchored=A\n"
         .. "local function add(t) for i=1,#t do A[#A+1]=t[i] end end\n"
     local anchored = data.anchored or EMPTY
     for i = 1, #anchored, CHUNK do
         n = n + 1; out[n] = "add((function() return {\n"
         for j = i, math.min(i + CHUNK - 1, #anchored) do
-            n = n + 1; out[n] = serializeStroke(anchored[j])
+            n = n + 1; out[n] = serializeStroke(anchored[j]) .. ",\n"
         end
         n = n + 1; out[n] = "} end)())\n"
     end
@@ -347,6 +517,7 @@ function EpubStorage.serialize(data)
     return table.concat(out)
 end
 
+-- Writes the full snapshot (atomic: tmp file + rename).
 function EpubStorage:save()
     if self.read_only then return false end
     self:ensureDir()
@@ -371,24 +542,54 @@ function EpubStorage:save()
     return true
 end
 
--- Debounced save: coalesces bursts of strokes into one write.
-function EpubStorage:markDirty()
-    self.dirty = true
-    local UIManager = require("ui/uimanager")
-    UIManager:unschedule(self.save_cb)
-    UIManager:scheduleIn(EpubStorage.SAVE_DELAY, self.save_cb)
+-- Folds the journal into a new snapshot, then deletes the journal.
+function EpubStorage:compact()
+    if self.read_only then return false end
+    if self.journal then
+        self.journal:close()
+        self.journal = nil
+    end
+    if not self:save() then return false end
+    os.remove(self.journal_path)
+    return true
 end
 
-function EpubStorage:flush()
-    if self.dirty then
-        self:save()
+-- Appends one op to the journal: O(size of the change), not of the book.
+function EpubStorage:append(line)
+    if self.read_only then return end
+    self.dirty = true
+    if not self.journal then
+        self:ensureDir()
+        local f, err = io.open(self.journal_path, "ab")
+        if not f then
+            logger.err("BooxPen: cannot open annotation journal " .. self.journal_path .. ": " .. tostring(err))
+            return
+        end
+        self.journal = f
     end
+    self.journal:write(line)
+    self.journal:flush()
+end
+
+-- Every op is already on disk once append returns; kept for callers that
+-- flush on suspend / settings flush.
+function EpubStorage:flush()
+    if self.journal then self.journal:flush() end
 end
 
 function EpubStorage:close()
-    local UIManager = require("ui/uimanager")
-    UIManager:unschedule(self.save_cb)
-    self:flush()
+    if self.dirty then
+        self:compact()
+    elseif self.journal then
+        self.journal:close()
+        self.journal = nil
+    end
+end
+
+function EpubStorage:newId()
+    local id = self.data.next_id
+    self.data.next_id = id + 1
+    return id
 end
 
 function EpubStorage:getStrokes(page_num)
@@ -404,44 +605,45 @@ end
 function EpubStorage:addStroke(page_num, stroke)
     if not page_num or not stroke then return end
     local key = tostring(page_num)
-    local list = self.data.pages[key]
-    if not list then
-        list = {}
-        self.data.pages[key] = list
-    end
-    table.insert(list, stroke)
-    self:markDirty()
+    stroke.id = self:newId()
+    self:applyAdd(key, stroke)
+    self:append(string.format("S(%q,%s)\n", key, serializeStroke(stroke)))
 end
 
+local function removeIds(self, ids)
+    if #ids == 0 then return end
+    self:applyRemove(ids)
+    self:append("R{" .. table.concat(ids, ",") .. "}\n")
+end
+
+-- Removes the page's newest stroke; returns it (nil when the page is empty)
 function EpubStorage:undo(page_num)
-    if not page_num then return end
+    if not page_num then return nil end
     local strokes = self.data.pages[tostring(page_num)]
     if strokes and #strokes > 0 then
-        table.remove(strokes)
-        self:markDirty()
+        local s = strokes[#strokes]
+        removeIds(self, { s.id })
+        return s
     end
+    return nil
 end
 
 -- Removes the page's strokes in `set` (stroke tables mapped to true)
 function EpubStorage:removeStrokes(page_num, set)
     if not page_num then return end
-    local key = tostring(page_num)
-    local strokes = self.data.pages[key]
-    if not strokes then return end
-    local kept = {}
-    for _, s in ipairs(strokes) do
-        if not set[s] then table.insert(kept, s) end
+    local ids = {}
+    for _, s in ipairs(self.data.pages[tostring(page_num)] or EMPTY) do
+        if set[s] then ids[#ids + 1] = s.id end
     end
-    if #kept ~= #strokes then
-        self.data.pages[key] = #kept > 0 and kept or nil
-        self:markDirty()
-    end
+    removeIds(self, ids)
 end
 
 function EpubStorage:clearPage(page_num)
     if not page_num then return end
-    self.data.pages[tostring(page_num)] = nil
-    self:markDirty()
+    local key = tostring(page_num)
+    if not self.data.pages[key] then return end
+    self:applyClear(key)
+    self:append(string.format("C(%q)\n", key))
 end
 
 -- Removes and returns a page's screen-positioned strokes (for converting
@@ -450,8 +652,8 @@ function EpubStorage:takePage(page_num)
     local key = tostring(page_num)
     local list = self.data.pages[key]
     if not list or #list == 0 then return nil end
-    self.data.pages[key] = nil
-    self:markDirty()
+    self:applyClear(key)
+    self:append(string.format("C(%q)\n", key))
     return list
 end
 
@@ -460,22 +662,18 @@ function EpubStorage:getAnchored()
 end
 
 function EpubStorage:addAnchored(stroke)
-    table.insert(self.data.anchored, stroke)
-    self.anchored_rev = self.anchored_rev + 1
-    self:markDirty()
+    stroke.id = self:newId()
+    self:applyAdd(nil, stroke)
+    self:append("A(" .. serializeStroke(stroke) .. ")\n")
 end
 
 -- `set` maps stroke tables to true
 function EpubStorage:removeAnchored(set)
-    local kept = {}
+    local ids = {}
     for _, s in ipairs(self.data.anchored) do
-        if not set[s] then table.insert(kept, s) end
+        if set[s] then ids[#ids + 1] = s.id end
     end
-    if #kept ~= #self.data.anchored then
-        self.data.anchored = kept
-        self.anchored_rev = self.anchored_rev + 1
-        self:markDirty()
-    end
+    removeIds(self, ids)
 end
 
 return EpubStorage

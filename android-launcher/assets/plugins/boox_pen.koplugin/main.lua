@@ -5,9 +5,11 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 local logger = require("logger")
+local time = require("ui/time")
 
 local Anchor = require("anchor")
 local EpubStorage = require("epub_storage")
+local InkLayer = require("ink_layer")
 local Renderer = require("renderer")
 
 local loadstring = loadstring or load -- luacheck: ignore
@@ -91,8 +93,37 @@ local ANCHOR_GROUP_MAX_H = 260
 local ERASER_REACH_PX = 12
 -- Seconds the pen must rest before new ink is pushed to the panel
 local PEN_UP_REFRESH_DELAY = 0.5
+-- Cached ink layers (views) kept, about 2.6 MB each on the Max Lumi: the
+-- current page plus the ones just turned away from
+local INK_CACHE_SIZE = 3
 
 local EMPTY = {}
+
+-- Android system property (debug.* can be set with `adb shell setprop`), or
+-- nil when unset or unavailable
+local function getprop(name)
+    local ok, f = pcall(io.popen, "getprop " .. name)
+    if not ok or not f then return nil end
+    local v = f:read("*l")
+    f:close()
+    if v == nil or v == "" then return nil end
+    return v
+end
+
+-- debug.koreader.boox.ink_cache 0: draw every stroke on every repaint (the
+-- pre-cache renderer, for comparison). debug.koreader.boox.perf 1: log
+-- render and storage timings at info level.
+local INK_CACHE = getprop("debug.koreader.boox.ink_cache") ~= "0"
+local PERF = getprop("debug.koreader.boox.perf") == "1"
+
+local function perfLog(what, t0, ...)
+    if not PERF then return end
+    logger.info("BooxPen perf:", what, string.format("%.1fms", (time.monotonic() - t0) / 1000), ...)
+end
+
+local function boxesOverlap(a, b)
+    return a[1] < b[3] and b[1] < a[3] and a[2] < b[4] and b[2] < a[4]
+end
 
 -- Smallest {x, y, w, h} covering both regions; either may be nil.
 local function unionRegion(a, b)
@@ -294,7 +325,10 @@ function BooxPen:onReaderReady()
     active_instance = self
 
     -- Initialize document sidecar storage
+    local t0 = time.monotonic()
     self.storage = EpubStorage:new(self.ui.document.file)
+    perfLog("storage load", t0)
+    self.ink_layers = {}
     -- Reflowable documents (EPUB, FB2, ...) anchor ink to the text;
     -- fixed-layout ones (PDF, CBZ) keep screen-relative page coordinates.
     self.anchored_mode = Anchor.isSupported(self.ui)
@@ -308,11 +342,29 @@ function BooxPen:onReaderReady()
         self.orig_paintTo = reader_view.paintTo
         local plugin_self = self
         reader_view.paintTo = function(this, bb, x, y)
+            local t0 = PERF and time.monotonic()
             plugin_self.orig_paintTo(this, bb, x, y)
+            if PERF then perfLog("page paint (KOReader)", t0) end
             plugin_self:onPaintPage(bb, x, y)
         end
         self.patched_view = reader_view
         logger.info("BooxPen: successfully hooked into ReaderView:paintTo")
+    end
+
+    -- Developer benchmark, test documents only (see runInkBench)
+    local bench = tonumber(getprop("debug.koreader.boox.bench") or "")
+    if bench and self.ui.document.file:find("/inktest/", 1, true) then
+        UIManager:scheduleIn(5, function() self:runInkBench(bench) end)
+    end
+    -- Test documents: jump to the first anchored stroke
+    if getprop("debug.koreader.boox.goto_ink") == "1" and self.anchored_mode
+            and self.ui.document.file:find("/inktest/", 1, true) then
+        local first = self.storage:getAnchored()[1]
+        if first then
+            UIManager:scheduleIn(2, function()
+                self.ui:handleEvent(require("ui/event"):new("GotoXPointer", first.a))
+            end)
+        end
     end
 
     if self.auto_enable_drawing then
@@ -336,9 +388,14 @@ function BooxPen:onCloseDocument()
     end
     self.pending_refresh = nil
     if self.storage then
+        local t0 = time.monotonic()
         self.storage:close()
+        perfLog("storage close", t0)
         self.storage = nil
     end
+    for _, layer in ipairs(self.ink_layers or EMPTY) do layer:free() end
+    self.ink_layers = nil
+    self.anchor_cache = nil
     if self.patched_view and self.orig_paintTo then
         self.patched_view.paintTo = self.orig_paintTo
         self.patched_view = nil
@@ -390,19 +447,26 @@ function BooxPen:getVisibleAnchored()
     if #list == 0 then return EMPTY end
     local doc = self.ui.document
 
-    -- Page and document position of every anchor, recomputed only when the
-    -- layout (or the stroke list) changes
-    local key = Anchor.layoutKey(doc) .. ":" .. self.storage.anchored_rev
+    -- Page and document position per anchor xpointer in the current layout,
+    -- looked up lazily and kept until the layout changes. Strokes of one
+    -- burst share an anchor, so a new stroke costs at most one lookup
+    -- (instead of re-resolving every anchored stroke in the book).
+    local key = Anchor.layoutKey(doc)
     local cache = self.anchor_cache
     if not cache or cache.key ~= key then
-        cache = { key = key, ay = {}, page = {} }
-        for _, s in ipairs(list) do
-            local ok, ay = pcall(doc.getPosFromXPointer, doc, s.a)
-            if ok and ay then cache.ay[s] = ay end
-            local okp, pg = pcall(doc.getPageFromXPointer, doc, s.a)
-            if okp and pg then cache.page[s] = pg end
-        end
+        cache = { key = key, pos = {} }
         self.anchor_cache = cache
+    end
+    local pos = cache.pos
+    local function lookup(a)
+        local e = pos[a]
+        if not e then
+            local ok, ay = pcall(doc.getPosFromXPointer, doc, a)
+            local okp, pg = pcall(doc.getPageFromXPointer, doc, a)
+            e = { ay = ok and ay or nil, page = okp and pg or nil }
+            pos[a] = e
+        end
+        return e
     end
 
     -- Page mode: the pages on screen (two in dual-page view). Scroll mode:
@@ -419,21 +483,28 @@ function BooxPen:getVisibleAnchored()
         lo, hi = top - screen_h, top + screen_h
     end
     local fs_now = Anchor.fontSize(doc)
+    local screen = {} -- xpointer -> {x, y} on screen, or false
     local out = {}
     for _, s in ipairs(list) do
-        local visible
-        if page_mode then
-            local pg = cache.page[s]
-            visible = pg and pg >= first_page and pg <= last_page
-        else
-            local ay = cache.ay[s]
-            visible = ay and ay >= lo and ay < hi
-        end
-        if visible then
-            local rx, ry = Anchor.screenPos(doc, s.a)
-            if rx then
-                local scale = (s.fs and s.fs > 0 and fs_now > 0) and fs_now / s.fs or 1
-                table.insert(out, { stroke = s, tx = { sx = scale, sy = scale, ox = rx, oy = ry } })
+        if s.a then
+            local e = lookup(s.a)
+            local visible
+            if page_mode then
+                visible = e.page and e.page >= first_page and e.page <= last_page
+            else
+                visible = e.ay and e.ay >= lo and e.ay < hi
+            end
+            if visible then
+                local sp = screen[s.a]
+                if sp == nil then
+                    local rx, ry = Anchor.screenPos(doc, s.a)
+                    sp = rx and { rx, ry } or false
+                    screen[s.a] = sp
+                end
+                if sp then
+                    local scale = (s.fs and s.fs > 0 and fs_now > 0) and fs_now / s.fs or 1
+                    table.insert(out, { stroke = s, tx = { sx = scale, sy = scale, ox = sp[1], oy = sp[2] } })
+                end
             end
         end
     end
@@ -506,7 +577,135 @@ function BooxPen:convertLegacyPage(page)
     self.anchor_group = nil
     for _, s in ipairs(kept) do self.storage:addStroke(page, s) end
     logger.info("BooxPen: anchored", converted, "legacy strokes on page", page, "kept", #kept)
+    self:invalidateInk()
     self:refreshView()
+end
+
+-- Identifies what the ink on screen depends on: a cached ink layer is
+-- valid exactly as long as this stays the same (and no stroke is removed
+-- behind its back, see invalidateInk / repairInk).
+function BooxPen:inkViewKey()
+    local parts = { Screen:getWidth(), Screen:getHeight(), self.ink_weight, self:getCurrentPageNumber() }
+    if self.anchored_mode then
+        local doc = self.ui.document
+        parts[#parts + 1] = Anchor.layoutKey(doc)
+        if self.view.view_mode ~= "page" then
+            local ok, pos = pcall(doc.getCurrentPos, doc)
+            parts[#parts + 1] = ok and tostring(pos) or "?"
+        end
+    end
+    return table.concat(parts, "|")
+end
+
+-- Rasterizes every stroke visible in the current view into `layer`.
+function BooxPen:buildInkLayer(layer)
+    local t0 = time.monotonic()
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local tx = Renderer.screenTransform(screen_w, screen_h)
+    local strokes = self.storage:getStrokes(self:getCurrentPageNumber())
+    for _, s in ipairs(strokes) do
+        layer:addStroke(s, tx, self.ink_weight)
+    end
+    local n_anchored = 0
+    if self.anchored_mode then
+        local items = self:getVisibleAnchored()
+        for _, it in ipairs(items) do
+            layer:addStroke(it.stroke, it.tx, self.ink_weight)
+        end
+        n_anchored = #items
+    end
+    perfLog("ink layer build", t0, #strokes, "page strokes,", n_anchored, "anchored")
+end
+
+-- The cached ink layer for view `key`, built on a miss (reusing the least
+-- recently used layer's buffers when the cache is full).
+function BooxPen:inkLayerFor(key)
+    local layers = self.ink_layers
+    for i, layer in ipairs(layers) do
+        if layer.key == key then
+            if i > 1 then
+                table.remove(layers, i)
+                table.insert(layers, 1, layer)
+            end
+            return layer
+        end
+    end
+    local w, h = Screen:getWidth(), Screen:getHeight()
+    local layer
+    if #layers >= INK_CACHE_SIZE then
+        layer = table.remove(layers)
+        if layer.w ~= w or layer.h ~= h then
+            layer:free()
+            layer = nil
+        else
+            layer:clear()
+        end
+    end
+    layer = layer or InkLayer.new(w, h)
+    self:buildInkLayer(layer)
+    layer.key = key
+    table.insert(layers, 1, layer)
+    return layer
+end
+
+-- The layer showing the current view, if it is cached (nil otherwise: the
+-- next paint builds it from storage, so there is nothing to update).
+function BooxPen:currentInkLayer()
+    local layers = self.ink_layers
+    local layer = layers and layers[1]
+    if layer and layer.key and layer.key == self:inkViewKey() then
+        return layer
+    end
+    return nil
+end
+
+-- Drops every cached layer except `keep`: they may show strokes that just
+-- changed (dual-page or scroll views overlapping the current one).
+function BooxPen:dropOtherInkLayers(keep)
+    for _, layer in ipairs(self.ink_layers or EMPTY) do
+        if layer ~= keep then layer:clear() end
+    end
+end
+
+-- Forgets all cached ink; the next paint re-rasterizes the view.
+function BooxPen:invalidateInk()
+    self:dropOtherInkLayers(nil)
+end
+
+-- After strokes were removed: erases the screen box {x0, y0, x1, y1} from
+-- the current layer and redraws the remaining strokes overlapping it, as
+-- Onyx Notes does, instead of re-rasterizing the whole view.
+function BooxPen:repairInk(box)
+    local layer = self:currentInkLayer()
+    self:dropOtherInkLayers(layer)
+    if not layer then return end
+    local t0 = time.monotonic()
+    layer:clearRect(box)
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local tx = Renderer.screenTransform(screen_w, screen_h)
+    local redrawn = 0
+    for _, s in ipairs(self.storage:getStrokes(self:getCurrentPageNumber())) do
+        local pad = Renderer.pointWidth(s.w or 5, 1, self.ink_weight)
+        if boxesOverlap(Renderer.screenBox(s, tx, pad), box) then
+            layer:addStroke(s, tx, self.ink_weight)
+            redrawn = redrawn + 1
+        end
+    end
+    if self.anchored_mode then
+        for _, it in ipairs(self:getVisibleAnchored()) do
+            local s = it.stroke
+            local pad = Renderer.pointWidth(s.w or 5, 1, self.ink_weight) * it.tx.sx
+            if boxesOverlap(Renderer.screenBox(s, it.tx, pad), box) then
+                layer:addStroke(s, it.tx, self.ink_weight)
+                redrawn = redrawn + 1
+            end
+        end
+    end
+    perfLog("ink repair", t0, redrawn, "strokes redrawn")
+end
+
+local function regionBox(r)
+    return { r.x, r.y, r.x + r.w, r.y + r.h }
 end
 
 function BooxPen:onPaintPage(bb, x, y)
@@ -526,9 +725,6 @@ function BooxPen:onPaintPage(bb, x, y)
     local current_page = self:getCurrentPageNumber()
     local strokes = self.storage:getStrokes(current_page)
     if #strokes > 0 then
-        logger.dbg("BooxPen: rendering", #strokes, "strokes on page", current_page)
-        Renderer.renderPageStrokes(bb, strokes,
-            Renderer.screenTransform(Screen:getWidth(), Screen:getHeight(), x, y), self.ink_weight)
         self.legacy_tried = self.legacy_tried or {}
         if self.anchored_mode and not self.legacy_pending and not self.legacy_tried[current_page] then
             -- Converted outside of painting; drawn as-is in the meantime.
@@ -544,6 +740,18 @@ function BooxPen:onPaintPage(bb, x, y)
         end
     end
 
+    local t0 = time.monotonic()
+    if INK_CACHE then
+        -- Where the view went on screen, for direct pen-up compositing
+        self.last_paint_x, self.last_paint_y = x, y
+        self:inkLayerFor(self:inkViewKey()):compose(bb, x, y)
+        perfLog("ink paint (cached)", t0)
+        return
+    end
+
+    -- Uncached: every stroke on every repaint
+    Renderer.renderPageStrokes(bb, strokes,
+        Renderer.screenTransform(Screen:getWidth(), Screen:getHeight(), x, y), self.ink_weight)
     if self.anchored_mode then
         local items = self:getVisibleAnchored()
         for _, it in ipairs(items) do
@@ -551,10 +759,8 @@ function BooxPen:onPaintPage(bb, x, y)
             tx.ox, tx.oy = tx.ox + x, tx.oy + y
             Renderer.renderStroke(bb, it.stroke, tx, self.ink_weight)
         end
-        if #items > 0 then
-            logger.dbg("BooxPen: rendered", #items, "anchored strokes")
-        end
     end
+    perfLog("ink paint (uncached)", t0, #strokes, "page strokes")
 end
 
 -- Repaints the reader and refreshes `region` (whole screen when nil).
@@ -665,8 +871,34 @@ function BooxPen:flushPenUpRefresh(force)
         return
     end
     self.pending_refresh = nil
+    local erased = self.pending_erase
+    self.pending_erase = nil
     logger.dbg("BooxPen: pen-up refresh", region.x, region.y, region.w, region.h)
-    self:refreshView(region)
+    if not erased and self:paintInkDirect(region) then
+        -- Screen refresh only: the page itself did not change
+        UIManager:setDirty(nil, "ui", Geom:new(region))
+    else
+        self:refreshView(region)
+    end
+end
+
+-- New ink only adds pixels, so instead of having KOReader repaint the
+-- whole reader (a full crengine re-render for reflowable books) it is
+-- composited from the cached layer straight onto the screen buffer, over
+-- the region the new strokes cover. Only possible while the reader is the
+-- topmost window (anything above it would be painted over) and the cached
+-- layer is the one on screen. Returns false when the caller must repaint.
+function BooxPen:paintInkDirect(region)
+    if not INK_CACHE or not self.last_paint_x then return false end
+    local stack = UIManager._window_stack
+    local top = stack and stack[#stack]
+    if not top or top.widget ~= self.ui then return false end
+    local layer = self:currentInkLayer()
+    if not layer then return false end
+    local t0 = time.monotonic()
+    layer:composeRect(Screen.bb, self.last_paint_x, self.last_paint_y, regionBox(region))
+    perfLog("pen-up direct compose", t0, region.w .. "x" .. region.h)
+    return true
 end
 
 -- Decodes the native stroke batch into { {w=, p={x,y,p,...}}, ... } in
@@ -706,11 +938,93 @@ function BooxPen:pollStrokes()
 
     local strokes = decodeStrokes(raw)
     if not strokes or #strokes == 0 then return end
+    self:ingestStrokes(strokes)
+end
 
+-- Developer benchmark: writes `n` synthetic handwriting strokes through the
+-- real ingest and pen-up refresh path, as bursts of 10 strokes (0.1 s
+-- apart, like the 100 ms poll) with a pause after each burst so its pen-up
+-- refresh runs. Timings go to the log with debug.koreader.boox.perf 1.
+-- Only started for documents under an /inktest/ folder (it adds ink).
+function BooxPen:runInkBench(n)
+    logger.info("BooxPen: ink benchmark,", n, "strokes")
+    local i = 0
+    local function step()
+        if not self.storage then return end
+        i = i + 1
+        local cx = 140 + ((i - 1) % 30) * 42
+        local cy = 1500 + math.floor((i - 1) / 30) * 70
+        local pts = {}
+        for k = 0, 24 do
+            local t = k / 24
+            pts[#pts + 1] = cx + 30 * (t - 0.5) + 10 * math.sin(9.4 * t)
+            pts[#pts + 1] = cy + 14 * math.cos(6.28 * t)
+            pts[#pts + 1] = 0.35 + 0.4 * math.sin(3.14 * t)
+        end
+        local t0 = time.monotonic()
+        self:ingestStrokes({ { w = self.pen_width, p = pts } })
+        perfLog("bench stroke", t0, i)
+        if i < n then
+            UIManager:scheduleIn(i % 10 == 0 and 1.5 or 0.1, step)
+        else
+            UIManager:scheduleIn(2, function()
+                if not self.storage then return end
+                -- Eraser pass over the first 5 strokes of the first row,
+                -- then undo of the newest stroke
+                local ex = {}
+                for x = 110, 330, 4 do
+                    ex[#ex + 1] = x
+                    ex[#ex + 1] = 1500
+                    ex[#ex + 1] = 0.5
+                end
+                local t0 = time.monotonic()
+                self:ingestStrokes({ { e = 1, p = ex } })
+                perfLog("bench erase", t0)
+                UIManager:scheduleIn(2, function()
+                    if not self.storage then return end
+                    t0 = time.monotonic()
+                    self:undo()
+                    perfLog("bench undo", t0)
+                    UIManager:scheduleIn(2, function() self:benchOldCosts() end)
+                end)
+            end)
+        end
+    end
+    step()
+end
+
+-- Times the work the pre-journal / pre-cache plugin repeated while writing,
+-- for comparison: re-resolving every anchored stroke (after each stroke),
+-- and re-serializing the whole book (every 3 s of writing).
+function BooxPen:benchOldCosts()
+    if not self.storage then return end
+    local doc = self.ui.document
+    if self.anchored_mode then
+        local t0 = time.monotonic()
+        local list = self.storage:getAnchored()
+        for _, s in ipairs(list) do
+            pcall(doc.getPosFromXPointer, doc, s.a)
+            pcall(doc.getPageFromXPointer, doc, s.a)
+        end
+        perfLog("old per-stroke anchor recompute", t0, #list, "anchored strokes")
+    end
+    local t0 = time.monotonic()
+    self.storage:save()
+    perfLog("old full-book save", t0)
+end
+
+-- Stores, rasterizes and schedules the pen-up refresh for a batch of
+-- strokes in screen px ({w=, p={x,y,p,...}}, with e=1 for eraser paths).
+function BooxPen:ingestStrokes(strokes)
+    local t0 = time.monotonic()
     local round = EpubStorage.round
     local current_page = self:getCurrentPageNumber()
     local screen_w = Screen:getWidth()
     local screen_h = Screen:getHeight()
+    local page_tx = Renderer.screenTransform(screen_w, screen_h)
+    -- New ink goes straight into the cached layer of this view, so the
+    -- pen-up repaint only composites it (see onPaintPage)
+    local layer = INK_CACHE and self:currentInkLayer()
     local added = {}
     local erased -- screen region covering everything the eraser removed
 
@@ -755,8 +1069,14 @@ function BooxPen:pollStrokes()
                     end
                     if anchored then
                         self.storage:addAnchored(anchored)
+                        if layer then
+                            -- Captured at the current font size: scale 1
+                            local g = self.anchor_group
+                            layer:addStroke(anchored, { sx = 1, sy = 1, ox = g.rx, oy = g.ry }, self.ink_weight)
+                        end
                     else
                         self.storage:addStroke(current_page, s)
+                        if layer then layer:addStroke(s, page_tx, self.ink_weight) end
                     end
                     table.insert(added, s)
                 end
@@ -769,13 +1089,15 @@ function BooxPen:pollStrokes()
     -- copy of erased ink).
     local region = erased
     if #added > 0 then
-        region = unionRegion(region, Renderer.strokesBounds(added,
-            Renderer.screenTransform(screen_w, screen_h), screen_w, screen_h, self.ink_weight))
+        if INK_CACHE then self:dropOtherInkLayers(layer) end
+        region = unionRegion(region, Renderer.strokesBounds(added, page_tx, screen_w, screen_h, self.ink_weight))
     end
+    perfLog("ingest", t0, #added, "strokes")
     if region and self.show_annotations then
         logger.dbg("BooxPen:", #added, "strokes added, erased", erased ~= nil,
             "pending refresh", region.w, region.h)
         self.pending_refresh = unionRegion(self.pending_refresh, region)
+        if erased then self.pending_erase = true end
         self:schedulePenUpRefresh()
     end
 end
@@ -816,7 +1138,10 @@ function BooxPen:eraseAlong(ex)
     local set, hits = {}, {}
     for _, s in ipairs(self.storage:getStrokes(page)) do
         local reach = ERASER_REACH_PX + Renderer.pointWidth(s.w or 5, 1, self.ink_weight) / 2
-        if strokeHit(s, page_tx, ex, ebox, reach) then
+        -- Bounding boxes first: only strokes near the eraser get the
+        -- point-by-point test
+        if boxesOverlap(Renderer.screenBox(s, page_tx, reach), ebox)
+                and strokeHit(s, page_tx, ex, ebox, reach) then
             set[s] = true
             hits[#hits + 1] = s
             removed = removed + 1
@@ -832,7 +1157,8 @@ function BooxPen:eraseAlong(ex)
         for _, it in ipairs(self:getVisibleAnchored()) do
             local s = it.stroke
             local reach = ERASER_REACH_PX + Renderer.pointWidth(s.w or 5, 1, self.ink_weight) / 2
-            if strokeHit(s, it.tx, ex, ebox, reach) then
+            if boxesOverlap(Renderer.screenBox(s, it.tx, reach), ebox)
+                    and strokeHit(s, it.tx, ex, ebox, reach) then
                 aset[s] = true
                 n = n + 1
                 region = unionRegion(region,
@@ -845,29 +1171,37 @@ function BooxPen:eraseAlong(ex)
         end
     end
     logger.info("BooxPen: eraser removed", removed, "strokes")
+    if region and INK_CACHE then self:repairInk(regionBox(region)) end
     return region
 end
 
 function BooxPen:undo()
     if not self.storage then return end
     local current_page = self:getCurrentPageNumber()
-    local removed = false
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local region
     if self.anchored_mode then
         -- Newest anchored stroke in view (the list is in writing order)
         local visible = {}
-        for _, it in ipairs(self:getVisibleAnchored()) do visible[it.stroke] = true end
+        for _, it in ipairs(self:getVisibleAnchored()) do visible[it.stroke] = it.tx end
         local list = self.storage:getAnchored()
         for i = #list, 1, -1 do
-            if visible[list[i]] then
-                self.storage:removeAnchored({ [list[i]] = true })
-                removed = true
+            local s = list[i]
+            if visible[s] then
+                region = Renderer.strokesBounds({ s }, visible[s], screen_w, screen_h, self.ink_weight)
+                self.storage:removeAnchored({ [s] = true })
                 break
             end
         end
     end
-    if not removed then
-        self.storage:undo(current_page)
+    if not region then
+        local s = self.storage:undo(current_page)
+        if s then
+            region = Renderer.strokesBounds({ s }, Renderer.screenTransform(screen_w, screen_h),
+                screen_w, screen_h, self.ink_weight)
+        end
     end
+    if region and INK_CACHE then self:repairInk(regionBox(region)) end
     self:refreshView()
     UIManager:show(require("ui/widget/notification"):new{
         text = _("Undid last stroke"),
@@ -884,6 +1218,7 @@ function BooxPen:clearPage()
         self.storage:removeAnchored(set)
     end
     self.storage:clearPage(current_page)
+    self:invalidateInk()
     self:refreshView()
     UIManager:show(require("ui/widget/notification"):new{
         text = _("Cleared page annotations"),
@@ -906,6 +1241,7 @@ function BooxPen:setShowAnnotations(show)
             self:setDrawingMode(true, true)
         end
     end
+    self:invalidateInk()
     self:refreshView()
 end
 
