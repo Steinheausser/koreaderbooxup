@@ -198,3 +198,141 @@ Root causes found by code reading (KOReader v2026.07.1 sources + onyxsdk jars):
   to the new strokes' bounding box.
 - Input adjust hooks chain forever; they are now installed once per process
   and dispatch to the active reader instance.
+
+## What Onyx Notes actually does (2026-10-26, reverse-engineered, untested here)
+
+Decompiled knote2/kreader2, framework.jar and libsurfaceflinger.so from the
+Max Lumi (fw 2023-12-12). Live ink is drawn by SurfaceFlinger itself: it opens
+the Wacom evdev node, runs the neopen brush engine and writes to `/dev/ebc`.
+Apps only drive it with Binder codes (`android.onyx.ViewUpdateHelper`), e.g.
+pen state `SET_SCREEN_HANDWRITING_PEN_STATE` 0 stop / 1 start / 2 drawing /
+3 pause / 4 erasing. Full write-up: `boox-pen-fastpath.md`.
+
+- **Pen-state regression (fixed):** `openRawDrawing()` sends state 1 and
+  `setRawDrawingEnabled(true)` sends 2; the bridge then sent 1 again, knocking
+  SF back to START. Now sends 2. Prime suspect for why `primeHardwarePen` was
+  "load-bearing".
+- **How Notes shows ink after lift:** it never toggles `enablePost`
+  (enter/leaveScribbleMode) per stroke. It redraws the dirty rect with update
+  mode `HAND_WRITING_REPAINT_MODE` (524290), which the panel commits while the
+  handwriting scheme stays active. `View.handwritingRepaint(view,l,t,r,b)`
+  exists on this firmware and is the same path.
+### Results (2026-10-26/27, on-device)
+
+- State 2 fix: live ink is instant without the prime; `primeHardwarePen`
+  is removed.
+- Wedge notches in the settled ink fixed by the capsule renderer
+  (`drawCapsule`).
+- Stroke eraser: rubber end or side button (`enableSideBtnErase(true)`)
+  queues the path as `{e=1,p=...}`; `BooxPen:eraseAlong` deletes visible
+  strokes within 12px (+ half width) and returns their bounds, so only that
+  area is refreshed (it used to repaint the whole screen).
+
+## Refresh path while inking: notes mode is the default (2026-10-27)
+
+Ground truth comes from the display HAL, not KOReader: `logcat | grep SDM`
+shows every real panel update (`update_to_display ... waveform_mode,
+update_mode, Rect, flags`), and `SWEpdcManager` logs scheme switches.
+
+- **Why everything flashed:** `OnyxEPDController` reports "full-only", so
+  KOReader's Android framebuffer (`ffi/framebuffer_android.lua`) sends only
+  *full* refreshes to `einkUpdate`; ui/partial/fast refreshes (stroke
+  repaints, menus, page turns) are left to the firmware. In the old per-stroke
+  model, pen-down entered scribble mode (`setEbcUpdateScheme 3`) and pen-up
+  left it (scheme 2), after which the firmware showed KOReader's next frame
+  as a **full-screen GC16** update (`waveform_mode = 2, update_mode = 1`):
+  one full flash per stroke, queueing up when writing fast. While the
+  handwriting scheme is active the firmware drops those refreshes entirely,
+  which is why the first notes-mode attempt "froze" the screen (KOReader kept
+  running; nothing reached the panel).
+- **Refresh hook (`installRefreshHook`, main.lua):** while inking, every
+  `refresh*Imp` region is also sent to `android.einkUpdate` with the
+  reserved mode `PEN_REPAINT_MODE` (0x40000000), which `MainActivity`
+  routes to `OnyxPenBridge.routeRefresh` only.
+- **Notes mode (default, `debug.koreader.boox.notes_mode 0` to disable):**
+  no enter/leave scribble per stroke; `routeRefresh` sends regions through
+  `EpdController.handwritingRepaint`, which the panel commits during the
+  handwriting scheme (`waveform_mode = 2, update_mode = 0`, flag 0x80000,
+  region only). It is the only path that works: `View.refreshScreen` with
+  the handwrite flag (REGAL 0x80006) is dropped, so page turns while inking
+  are full-page GC16 (slow, one flash). Leaving the scheme instead triggers
+  the firmware's own full GC16 clean-up, so there is nothing faster to fall
+  back to.
+- **Pen-up refresh (`PEN_UP_REFRESH_DELAY` 0.5s, like Notes' default):** new
+  and erased ink is stored at once but pushed to the panel only once the pen
+  has rested, as one update over the union of the burst. Live hardware ink
+  covers the gap. A panel update per stroke stacked GC16 updates and
+  repainted the area next to the letter being written.
+- **Settled ink weight** now defaults to "Same as live ink" (1.0; was 1.2),
+  with a new "Thinner" (0.8) option. The vector render was correct; 1.2x
+  plus the pressure multiplier simply read as much bolder than live ink.
+- **USB:** this unit's cable/port corrupts adb pushes (1–2 flipped bytes per
+  36MB APK, pulls are clean), so `adb install` fails v2 signature checks.
+  Push in hash-verified chunks, `cat` them together on the device, then
+  `pm install -r` the local file.
+- Builds: `scripts\build_apk.ps1` breaks on the `&` in the folder path and on
+  JDK 27; build through an `&`-free junction with JDK 21 instead.
+
+## Doubled strokes + text-anchored ink (2026-10-03, on-device)
+
+- **Start-to-end connector lines:** the SDK sends each stroke twice — per-move
+  callbacks AND one end-of-stroke `TouchPointList` (before `onEnd`). Both
+  were appended, so every stroke held its points twice and rendered a line
+  from its end back to its start (long ones were hidden by the teleport
+  splitter). Verified on-device: second half == first half exactly. Fix: a
+  list starting at the stroke's first point replaces the gathered moves.
+  Storage v3 repair undoubles saved strokes and drops identical neighbours.
+- **Text-anchored ink (storage v4, reflowable docs only):** strokes store
+  the xpointer of the nearest word (`a`), the font size at capture (`fs`)
+  and px offsets from that word's screen position; render places them at
+  the word's current position scaled by the font-size ratio (`anchor.lua`).
+  Strokes written within 4s/120px of the previous one share its anchor
+  (group height capped at 260px) so handwriting moves as one piece.
+  Visibility: anchor page (`getPageFromXPointer`, cached per
+  `getDocumentRenderingHash`) within the visible page numbers (dual-page
+  view shows 2); scroll mode uses doc-y range. Legacy page-keyed strokes
+  are converted the first time their page is shown (assumes the layout on
+  screen is the one they were written in). PDFs keep screen-relative coords.
+- Verified: 42 legacy strokes on a dual-page portrait spread converted in
+  ~45ms; screenshot diff vs. before conversion ~340 px (rounding only).
+
+## Ink performance: cached layer, direct pen-up, journal (2026-10-29, on-device)
+
+Modelled on Onyx Notes/NeoReader (one transparent ink bitmap per page, only
+the new stroke drawn at pen-up, incremental saves). Measured with the
+in-plugin benchmark (`setprop debug.koreader.boox.perf 1` and
+`debug.koreader.boox.bench 40`, test docs under `/sdcard/koreader/inktest/`
+only), synthetic page = 800 strokes x 25 points; real books have far less
+(largest real sidecar: 106 strokes, ~43 points each).
+
+- **Cached ink layer (`ink_layer.lua`):** one BB8 coverage mask per ink
+  colour, composited with `colorblitFrom` (C, the glyph path). LRU of 3
+  views keyed by page + screen size + ink weight (+ layout hash / scroll
+  position when anchored). Masks are filled with direct `ffi.fill` spans
+  (`Renderer.maskFiller`), no `paintRect` per row. Repaint with ink: 45-90ms
+  of Lua redraw -> ~20ms composite (constant in ink amount); first view of a
+  page builds the layer once (~90ms for 800 strokes).
+- **Direct pen-up:** new ink is drawn into the layer at ingest; the pen-up
+  refresh composites just the new strokes' box onto `Screen.bb` and does a
+  refresh-only `setDirty(nil, "ui", region)`. No ReaderUI repaint, so no
+  crengine re-render. Per burst: 40-130ms -> 0.2-0.5ms. Falls back to the
+  full repaint after an erase or when any window is above the reader.
+- **Local erase/undo:** clear the removed strokes' box in the layer and
+  redraw only the strokes overlapping it (`repairInk`, 1.5-2.5ms); per-stroke
+  bounding boxes (`Renderer.strokeBox`, memoized as `_b`) also prefilter the
+  eraser hit test.
+- **Anchors:** positions cached per xpointer per layout, filled lazily; a new
+  stroke no longer re-resolves every anchored stroke in the book (that cost
+  turned out to be small: 2ms for 400 anchors).
+- **Storage v5 + journal:** strokes get ids; each change appends one line to
+  `boox_stylus_annotations.journal` (`S`/`A` add, `R{ids}` remove, `C` clear;
+  <1ms), and the snapshot is rewritten only on close or when a journal is
+  found on load. Replay is idempotent (verified on-device by replaying over a
+  snapshot that already held the ops). Old cost: a full-book rewrite every
+  3s while writing (30-50ms on the test books). Snapshot pages are now split
+  into 400-stroke functions (LuaJIT constant limits). Offline tests: 24 pass.
+- `setprop debug.koreader.boox.ink_cache 0` restores the uncached renderer
+  for A/B (read at plugin load: restart KOReader).
+- Still open: the firmware turns every `handwritingRepaint` into a
+  full-panel GC16 partial update (`SDM ... Rect[0 0 2200 1650]`), whatever
+  region is requested.

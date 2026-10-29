@@ -365,6 +365,13 @@ class MainActivity : NativeActivity(), LuaInterface,
             "requesting epd update, mode:%d, delay:%d, [x:%d, y:%d, w:%d, h:%d]",
             mode, delay, x, y, width, height))
 
+        if (mode == OnyxPenBridge.PEN_REPAINT_MODE) {
+            // Pen-session repaint region from the boox_pen plugin; never a
+            // regular EPD mode, so it must not fall through to setEpdMode.
+            OnyxPenBridge.routeRefresh(rootView, delay, x, y, width, height)
+            return
+        }
+        if (OnyxPenBridge.routeRefresh(rootView, delay, x, y, width, height)) return
         device.epd.setEpdMode(rootView, mode, delay, x, y, width, height, null)
     }
 
