@@ -336,3 +336,58 @@ only), synthetic page = 800 strokes x 25 points; real books have far less
 - Still open: the firmware turns every `handwritingRepaint` into a
   full-panel GC16 partial update (`SDM ... Rect[0 0 2200 1650]`), whatever
   region is requested.
+## Erase / page-turn pass: KOReader-side refresh costs (2026-10-29, untested on device)
+
+Traced the KOReader side of an erase and a page turn (KOReader master
+2026-10-28: `readerview.lua`, `credocument.lua`, `ffi/framebuffer_android.lua`).
+Everything below is in the plugin (runtime patches of KOReader objects), not
+in the launcher, so it survives KOReader upgrades. Not built or run on
+device yet; the offline tests (stub blitbuffer) pass.
+
+- **Erase waited for the pen to rest.** The eraser path arrives at eraser
+  lift, then the refresh was scheduled like new ink: +0.5 s
+  (`PEN_UP_REFRESH_DELAY`) before anything changed on screen, though the
+  eraser leaves no live ink to cover the wait. The erase refresh now runs
+  right away (any ink written just before goes out with it).
+- **Erase/undo re-rendered the whole page.** After removing strokes the
+  plugin did `setDirty(ReaderUI)`. That repaints the whole reader, and
+  `CreDocument:drawCurrentView` has crengine draw the full page again on
+  every paint (no buffer reuse upstream, see its `@todo`). New
+  `page_snapshot.lua` keeps a clean copy of the reader's pixels under the ink
+  (captured in the `paintTo` hook before the layer is composited, grown
+  by every pen-up direct compose). An erase or undo now copies the clean
+  pixels back over the removed strokes' box, composites the repaired layer
+  there, and does a refresh-only `setDirty(nil, "ui", region)`, the same as
+  pen-up. This only works while inking is on (the snapshot, up to one
+  screen buffer, 14.5 MB on the Max Lumi, is freed when inking is off). It
+  falls back to the old repaint when anything is above the reader or the
+  screen buffer changed. `setprop debug.koreader.boox.direct_erase 0`
+  restores the repaint.
+- **Every refresh posted the whole screen.** Stock `_updateWindow` locks the
+  ANativeWindow with no dirty rect and copies all 14.5 MB, even for a
+  30x30 px pen-up refresh. New `window_post.lua` (only while inking) passes
+  the refresh rect as the lock's dirty bounds and copies only the bounds
+  that Surface hands back. Surface copies the rest from the previous frame
+  and widens the bounds to the whole buffer when it can't. Rotated or
+  inverted (night mode) buffers keep the stock path.
+  `setprop debug.koreader.boox.partial_post 0` disables it.
+  Unverified idea: as an app connected to a CPU-locked Surface, SF still
+  receives full-surface damage, so this probably doesn't change the
+  firmware's full-panel GC16 (see "Still open" above). Check with `SDM` logs.
+- **Visible anchored strokes are cached** per view, layout and
+  `anchored_rev`. Each erase and undo resolved them twice (hit test, then
+  layer repair), with a crengine `getScreenPositionFromXPointer` call per
+  visible anchor each time.
+- **Page turns:** the CPU work in the plugin was already small (cached layer
+  build, about 20 ms composite). What remains on a turn while inking is
+  crengine's page draw and the firmware's full-panel GC16 from
+  `handwritingRepaint`. The second can only be fixed in the launcher.
+  Next experiment (needs a device): NeoReader pauses the pen around page
+  turns (`penState 3`, resume about 600 ms later, see `boox-pen-fastpath.md`)
+  instead of repainting through the handwriting path. Also, full refreshes
+  routed through `routeRefresh` keep KOReader's 250 ms `delay_page`, which
+  handwritingRepaint likely doesn't need (partial refreshes already use 0).
+
+Perf log lines to compare on device (`setprop debug.koreader.boox.perf 1`):
+`erase direct compose`, `clean page capture`, `pen-up direct compose`,
+plus `ink repair` as before.

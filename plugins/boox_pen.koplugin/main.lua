@@ -10,7 +10,9 @@ local time = require("ui/time")
 local Anchor = require("anchor")
 local EpubStorage = require("epub_storage")
 local InkLayer = require("ink_layer")
+local PageSnapshot = require("page_snapshot")
 local Renderer = require("renderer")
+local WindowPost = require("window_post")
 
 local loadstring = loadstring or load -- luacheck: ignore
 
@@ -112,9 +114,15 @@ end
 
 -- debug.koreader.boox.ink_cache 0: draw every stroke on every repaint (the
 -- pre-cache renderer, for comparison). debug.koreader.boox.perf 1: log
--- render and storage timings at info level.
+-- render and storage timings at info level. debug.koreader.boox.partial_post
+-- 0: post the whole screen to the Android window on every refresh (stock
+-- KOReader) instead of the refreshed rect only (see window_post.lua).
+-- debug.koreader.boox.direct_erase 0: repaint the reader after erase/undo
+-- instead of restoring the clean page under the removed ink.
 local INK_CACHE = getprop("debug.koreader.boox.ink_cache") ~= "0"
 local PERF = getprop("debug.koreader.boox.perf") == "1"
+local PARTIAL_POST = getprop("debug.koreader.boox.partial_post") ~= "0"
+local DIRECT_ERASE = INK_CACHE and getprop("debug.koreader.boox.direct_erase") ~= "0"
 
 local function perfLog(what, t0, ...)
     if not PERF then return end
@@ -160,6 +168,11 @@ local function installRefreshHook()
     if refresh_hook_installed then return end
     local a = getAndroid()
     if not (a and a.einkUpdate) then return end
+    if PARTIAL_POST then
+        WindowPost.install(Screen, a, function()
+            return active_instance ~= nil and active_instance.is_drawing_active
+        end)
+    end
     for _, name in ipairs(REFRESH_IMPS) do
         local orig = Screen[name]
         if type(orig) == "function" then
@@ -334,6 +347,7 @@ function BooxPen:onReaderReady()
     self.anchored_mode = Anchor.isSupported(self.ui)
     logger.info("BooxPen: text-anchored ink", self.anchored_mode and "enabled" or "disabled")
     self.anchor_cache = nil
+    self.visible_anchored = nil
     self.anchor_group = nil
 
     -- Hook into ReaderView:paintTo to render vector ink over the document page
@@ -395,7 +409,12 @@ function BooxPen:onCloseDocument()
     end
     for _, layer in ipairs(self.ink_layers or EMPTY) do layer:free() end
     self.ink_layers = nil
+    if self.clean_page then
+        self.clean_page:free()
+        self.clean_page = nil
+    end
     self.anchor_cache = nil
+    self.visible_anchored = nil
     if self.patched_view and self.orig_paintTo then
         self.patched_view.paintTo = self.orig_paintTo
         self.patched_view = nil
@@ -472,16 +491,27 @@ function BooxPen:getVisibleAnchored()
     -- Page mode: the pages on screen (two in dual-page view). Scroll mode:
     -- anchors within a screen above/below the current position.
     local page_mode = self.view.view_mode == "page"
-    local first_page, last_page, lo, hi
+    local first_page, last_page, lo, hi, top
     if page_mode then
         first_page = doc:getCurrentPage()
         local okn, n = pcall(doc.getVisiblePageNumberCount, doc)
         last_page = first_page + ((okn and tonumber(n) or 1) - 1)
     else
-        local top = doc:getCurrentPos()
+        top = doc:getCurrentPos()
         local screen_h = Screen:getHeight()
         lo, hi = top - screen_h, top + screen_h
     end
+
+    -- The result only changes with the view and the anchored strokes; an
+    -- erase or undo asks for it twice (hit test, then layer repair), a
+    -- page turn once for the layer build.
+    local view_key = table.concat({ key, page_mode and "p" or "s", first_page or top, last_page or "",
+        self.storage.anchored_rev, Screen:getWidth(), Screen:getHeight() }, "|")
+    local visible_cache = self.visible_anchored
+    if visible_cache and visible_cache.key == view_key and visible_cache.list == list then
+        return visible_cache.items
+    end
+
     local fs_now = Anchor.fontSize(doc)
     local screen = {} -- xpointer -> {x, y} on screen, or false
     local out = {}
@@ -508,6 +538,7 @@ function BooxPen:getVisibleAnchored()
             end
         end
     end
+    self.visible_anchored = { key = view_key, list = list, items = out }
     return out
 end
 
@@ -744,7 +775,9 @@ function BooxPen:onPaintPage(bb, x, y)
     if INK_CACHE then
         -- Where the view went on screen, for direct pen-up compositing
         self.last_paint_x, self.last_paint_y = x, y
-        self:inkLayerFor(self:inkViewKey()):compose(bb, x, y)
+        local layer = self:inkLayerFor(self:inkViewKey())
+        if bb == Screen.bb then self:captureCleanPage(bb, x, y, layer) end
+        layer:compose(bb, x, y)
         perfLog("ink paint (cached)", t0)
         return
     end
@@ -756,11 +789,36 @@ function BooxPen:onPaintPage(bb, x, y)
         local items = self:getVisibleAnchored()
         for _, it in ipairs(items) do
             local tx = it.tx
-            tx.ox, tx.oy = tx.ox + x, tx.oy + y
-            Renderer.renderStroke(bb, it.stroke, tx, self.ink_weight)
+            Renderer.renderStroke(bb, it.stroke,
+                { sx = tx.sx, sy = tx.sy, ox = tx.ox + x, oy = tx.oy + y }, self.ink_weight)
         end
     end
     perfLog("ink paint (uncached)", t0, #strokes, "page strokes")
+end
+
+-- Keeps the reader's pixels under the ink (before it is composited), so
+-- erased ink can be wiped without repainting the reader. Only while inking:
+-- the eraser only works then, and pages turned while reading skip the copy.
+function BooxPen:captureCleanPage(bb, x, y, layer)
+    local snap = self.clean_page
+    if not DIRECT_ERASE or not self.is_drawing_active then
+        if snap then
+            snap:free()
+            self.clean_page = nil
+        end
+        return
+    end
+    local t0 = time.monotonic()
+    if snap and (snap.w ~= layer.w or snap.h ~= layer.h) then
+        snap:free()
+        snap = nil
+    end
+    if not snap then
+        snap = PageSnapshot.new(layer.w, layer.h)
+        self.clean_page = snap
+    end
+    snap:capture(bb, x, y, layer.box)
+    perfLog("clean page capture", t0)
 end
 
 -- Repaints the reader and refreshes `region` (whole screen when nil).
@@ -874,7 +932,14 @@ function BooxPen:flushPenUpRefresh(force)
     local erased = self.pending_erase
     self.pending_erase = nil
     logger.dbg("BooxPen: pen-up refresh", region.x, region.y, region.w, region.h)
-    if not erased and self:paintInkDirect(region) then
+    self:showInk(region, erased)
+end
+
+-- Puts the current ink of `region` on the panel: composited straight onto
+-- the screen buffer when possible (see paintInkDirect), otherwise by
+-- repainting the reader. `removed`: ink was taken away there.
+function BooxPen:showInk(region, removed)
+    if self:paintInkDirect(region, removed) then
         -- Screen refresh only: the page itself did not change
         UIManager:setDirty(nil, "ui", Geom:new(region))
     else
@@ -885,10 +950,12 @@ end
 -- New ink only adds pixels, so instead of having KOReader repaint the
 -- whole reader (a full crengine re-render for reflowable books) it is
 -- composited from the cached layer straight onto the screen buffer, over
--- the region the new strokes cover. Only possible while the reader is the
--- topmost window (anything above it would be painted over) and the cached
--- layer is the one on screen. Returns false when the caller must repaint.
-function BooxPen:paintInkDirect(region)
+-- the region the new strokes cover. Removed ink (`removed`) is wiped first
+-- by copying back the clean page kept at paint time (see captureCleanPage).
+-- Only possible while the reader is the topmost window (anything above it
+-- would be painted over) and the cached layer is the one on screen.
+-- Returns false when the caller must repaint.
+function BooxPen:paintInkDirect(region, removed)
     if not INK_CACHE or not self.last_paint_x then return false end
     local stack = UIManager._window_stack
     local top = stack and stack[#stack]
@@ -896,8 +963,21 @@ function BooxPen:paintInkDirect(region)
     local layer = self:currentInkLayer()
     if not layer then return false end
     local t0 = time.monotonic()
-    layer:composeRect(Screen.bb, self.last_paint_x, self.last_paint_y, regionBox(region))
-    perfLog("pen-up direct compose", t0, region.w .. "x" .. region.h)
+    local box = regionBox(region)
+    -- Before any ink lands there: the clean page must cover every pixel
+    -- ink is ever composited onto, or a later erase could not wipe it
+    local snap = self.clean_page
+    if snap and snap.src ~= Screen.bb then
+        -- The screen buffer was replaced (rotation, resize) since the paint
+        snap:invalidate()
+    end
+    local covered = snap and snap:cover(box)
+    if removed then
+        if not covered then return false end
+        snap:restore(box)
+    end
+    layer:composeRect(Screen.bb, self.last_paint_x, self.last_paint_y, box)
+    perfLog(removed and "erase direct compose" or "pen-up direct compose", t0, region.w .. "x" .. region.h)
     return true
 end
 
@@ -1097,8 +1177,15 @@ function BooxPen:ingestStrokes(strokes)
         logger.dbg("BooxPen:", #added, "strokes added, erased", erased ~= nil,
             "pending refresh", region.w, region.h)
         self.pending_refresh = unionRegion(self.pending_refresh, region)
-        if erased then self.pending_erase = true end
-        self:schedulePenUpRefresh()
+        if erased then
+            -- The eraser leaves no live ink behind: waiting for the pen to
+            -- rest would only delay the strokes disappearing. Ink written
+            -- just before goes out with it.
+            self.pending_erase = true
+            self:flushPenUpRefresh(true)
+        else
+            self:schedulePenUpRefresh()
+        end
     end
 end
 
@@ -1201,8 +1288,10 @@ function BooxPen:undo()
                 screen_w, screen_h, self.ink_weight)
         end
     end
-    if region and INK_CACHE then self:repairInk(regionBox(region)) end
-    self:refreshView()
+    if region then
+        if INK_CACHE then self:repairInk(regionBox(region)) end
+        self:showInk(region, true)
+    end
     UIManager:show(require("ui/widget/notification"):new{
         text = _("Undid last stroke"),
         timeout = 1,
