@@ -3,10 +3,11 @@
 Work in progress. Also, this is entirely vibe-coded slop. Please, if you wish to use this, take your usual precautions / avoidance.
 
 Current State: Near-native writing works. However, it has a few large issues that I would say make neoreader still much better. 
-1. It behaves a bit like pen tool in photoshop where it will try to connect the start of your stroke to the end.
+~~1. It behaves a bit like pen tool in photoshop where it will try to connect the start of your stroke to the end.
 2. No eraser support.
 3. Toggling annotations does not work. they only go away when clearing it.
-4. Long sentences sometimes just have parts disappear. No clue why.
+4. Long sentences sometimes just have parts disappear. No clue why.~~
+1. Not great performance turning pages, and erasing takes awhile.
 
 Aim: Custom KOReader distribution and modular plugin providing **hardware-accelerated, low-latency stylus annotations** on Onyx Boox E-ink devices (tested for **Max Lumi 2020**, **Boox OS 3.5+**, **Android 10+**).
 
