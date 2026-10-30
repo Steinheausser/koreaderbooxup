@@ -1,3 +1,4 @@
+local BlitBuffer = require("ffi/blitbuffer")
 local JSON = require("json")
 local Geom = require("ui/geometry")
 local Screen = require("device").screen
@@ -395,6 +396,7 @@ function BooxPen:onCloseDocument()
     end
     for _, layer in ipairs(self.ink_layers or EMPTY) do layer:free() end
     self.ink_layers = nil
+    self:freePageSnapshot()
     self.anchor_cache = nil
     if self.patched_view and self.orig_paintTo then
         self.patched_view.paintTo = self.orig_paintTo
@@ -708,6 +710,41 @@ local function regionBox(r)
     return { r.x, r.y, r.x + r.w, r.y + r.h }
 end
 
+-- Copy of the screen as the reader painted it, before the ink went on top,
+-- kept while a pen session is active. Erasing then works like new ink, as
+-- in Onyx Notes: the erased box is restored from this copy and the
+-- remaining ink composited over it, straight onto the screen buffer,
+-- instead of a full ReaderUI repaint (a crengine re-render for reflowable
+-- books). Valid until the next paint of the reader replaces it.
+function BooxPen:snapshotPage(bb)
+    local snap = self.page_snapshot
+    if bb ~= Screen.bb or bb:getRotation() ~= 0 then
+        self.page_snapshot_valid = false
+        return
+    end
+    local w, h = bb:getWidth(), bb:getHeight()
+    if snap and (snap:getWidth() ~= w or snap:getHeight() ~= h or snap:getType() ~= bb:getType()) then
+        snap:free()
+        snap = nil
+    end
+    if not snap then
+        snap = BlitBuffer.new(w, h, bb:getType())
+        self.page_snapshot = snap
+    end
+    local t0 = time.monotonic()
+    snap:blitFrom(bb, 0, 0, 0, 0, w, h)
+    self.page_snapshot_valid = true
+    perfLog("page snapshot", t0)
+end
+
+function BooxPen:freePageSnapshot()
+    if self.page_snapshot then
+        self.page_snapshot:free()
+        self.page_snapshot = nil
+    end
+    self.page_snapshot_valid = false
+end
+
 function BooxPen:onPaintPage(bb, x, y)
     if self.pending_auto_enable then
         self.pending_auto_enable = false
@@ -720,7 +757,10 @@ function BooxPen:onPaintPage(bb, x, y)
         end)
     end
 
-    if not self.show_annotations or not self.storage then return end
+    if not self.show_annotations or not self.storage then
+        self.page_snapshot_valid = false
+        return
+    end
 
     local current_page = self:getCurrentPageNumber()
     local strokes = self.storage:getStrokes(current_page)
@@ -744,6 +784,11 @@ function BooxPen:onPaintPage(bb, x, y)
     if INK_CACHE then
         -- Where the view went on screen, for direct pen-up compositing
         self.last_paint_x, self.last_paint_y = x, y
+        if self.is_drawing_active then
+            self:snapshotPage(bb)
+        else
+            self.page_snapshot_valid = false
+        end
         self:inkLayerFor(self:inkViewKey()):compose(bb, x, y)
         perfLog("ink paint (cached)", t0)
         return
@@ -874,7 +919,7 @@ function BooxPen:flushPenUpRefresh(force)
     local erased = self.pending_erase
     self.pending_erase = nil
     logger.dbg("BooxPen: pen-up refresh", region.x, region.y, region.w, region.h)
-    if not erased and self:paintInkDirect(region) then
+    if self:paintInkDirect(region, erased) then
         -- Screen refresh only: the page itself did not change
         UIManager:setDirty(nil, "ui", Geom:new(region))
     else
@@ -888,14 +933,27 @@ end
 -- the region the new strokes cover. Only possible while the reader is the
 -- topmost window (anything above it would be painted over) and the cached
 -- layer is the one on screen. Returns false when the caller must repaint.
-function BooxPen:paintInkDirect(region)
+-- erased: ink was removed, so the page under it is first restored from
+-- the snapshot taken at the last paint (see snapshotPage).
+function BooxPen:paintInkDirect(region, erased)
     if not INK_CACHE or not self.last_paint_x then return false end
+    if erased and not self.page_snapshot_valid then return false end
     local stack = UIManager._window_stack
     local top = stack and stack[#stack]
     if not top or top.widget ~= self.ui then return false end
     local layer = self:currentInkLayer()
     if not layer then return false end
     local t0 = time.monotonic()
+    if erased then
+        local bb, snap = Screen.bb, self.page_snapshot
+        local x0 = math.max(0, math.floor(self.last_paint_x + region.x))
+        local y0 = math.max(0, math.floor(self.last_paint_y + region.y))
+        local x1 = math.min(bb:getWidth(), math.ceil(self.last_paint_x + region.x + region.w))
+        local y1 = math.min(bb:getHeight(), math.ceil(self.last_paint_y + region.y + region.h))
+        if x1 > x0 and y1 > y0 then
+            bb:blitFrom(snap, x0, y0, x0, y0, x1 - x0, y1 - y0)
+        end
+    end
     layer:composeRect(Screen.bb, self.last_paint_x, self.last_paint_y, regionBox(region))
     perfLog("pen-up direct compose", t0, region.w .. "x" .. region.h)
     return true
@@ -1097,8 +1155,16 @@ function BooxPen:ingestStrokes(strokes)
         logger.dbg("BooxPen:", #added, "strokes added, erased", erased ~= nil,
             "pending refresh", region.w, region.h)
         self.pending_refresh = unionRegion(self.pending_refresh, region)
-        if erased then self.pending_erase = true end
-        self:schedulePenUpRefresh()
+        if erased then
+            -- Nothing is inked live for the eraser, so there is no hardware
+            -- ink to cover a delay: show the erase now (the native side
+            -- streams the eraser path while it moves, so this runs at
+            -- every poll mid-gesture).
+            self.pending_erase = true
+            self:flushPenUpRefresh(true)
+        else
+            self:schedulePenUpRefresh()
+        end
     end
 end
 

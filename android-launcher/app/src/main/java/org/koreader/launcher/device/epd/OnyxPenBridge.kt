@@ -82,6 +82,13 @@ object OnyxPenBridge {
     @Volatile private var penDown = false
     @Volatile private var lastPenEndUptime = 0L
 
+    // Eraser in progress: its path is streamed to Lua at every poll instead
+    // of at lift, so strokes vanish while the eraser moves (as in Notes).
+    // eraseGotMoves: per-move points arrived, so the SDK's repeated full
+    // point list adds nothing (erasing again over the same path is a no-op).
+    @Volatile private var erasing = false
+    private var eraseGotMoves = false
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // Notes mode (default) copies Onyx Notes (knote2, fw 2023-12): no
@@ -168,12 +175,15 @@ object OnyxPenBridge {
             penDown = true
             synchronized(strokeLock) {
                 resetActiveStroke()
+                eraseGotMoves = false
+                erasing = true
                 addPoint(point)
             }
         }
 
         override fun onEndRawErasing(b: Boolean, point: TouchPoint) {
             synchronized(strokeLock) {
+                erasing = false
                 addPoint(point)
                 queueActiveStroke("e=1")
             }
@@ -183,13 +193,14 @@ object OnyxPenBridge {
 
         override fun onRawErasingTouchPointMoveReceived(point: TouchPoint) {
             synchronized(strokeLock) {
+                eraseGotMoves = true
                 addPoint(point)
             }
         }
 
         override fun onRawErasingTouchPointListReceived(pointList: TouchPointList) {
             synchronized(strokeLock) {
-                mergePointList(pointList)
+                if (!eraseGotMoves) appendPointList(pointList)
             }
         }
     }
@@ -233,6 +244,26 @@ object OnyxPenBridge {
         for (p in pts) {
             addPoint(p)
         }
+    }
+
+    // Caller holds strokeLock. Eraser lists are appended as they come: the
+    // path may already have been streamed in chunks (firstX no longer marks
+    // its start), and a repeated point costs Lua only a hit test.
+    private fun appendPointList(pointList: TouchPointList) {
+        val pts = pointList.points ?: return
+        for (p in pts) {
+            addPoint(p)
+        }
+    }
+
+    // Caller holds strokeLock. Queues the eraser points gathered so far and
+    // keeps gathering; the 3px downsampling continues from the last point.
+    private fun queueEraseChunk() {
+        val lx = lastAddedX
+        val ly = lastAddedY
+        queueActiveStroke("e=1")
+        lastAddedX = lx
+        lastAddedY = ly
     }
 
     fun isSupported(): Boolean {
@@ -624,6 +655,11 @@ object OnyxPenBridge {
      * Called by Lua layer.
      */
     fun pollStrokesJson(): String {
+        if (erasing) {
+            synchronized(strokeLock) {
+                if (erasing && activePointCount > 0) queueEraseChunk()
+            }
+        }
         if (pendingStrokes.isEmpty()) return ""
 
         val sb = StringBuilder("{")

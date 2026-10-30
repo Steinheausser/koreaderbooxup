@@ -336,3 +336,23 @@ only), synthetic page = 800 strokes x 25 points; real books have far less
 - Still open: the firmware turns every `handwritingRepaint` into a
   full-panel GC16 partial update (`SDM ... Rect[0 0 2200 1650]`), whatever
   region is requested.
+## Faster eraser (2026-10-30, untested on device)
+
+Erasing used to wait for: pen lift (the path was queued only at
+`onEndRawErasing`) -> next 100ms poll -> the 0.5s pen-up refresh delay, re-armed
+while `isPenActive` (400ms grace) -> a full ReaderUI repaint (crengine
+re-render), because removed ink needs the page underneath. Now:
+
+- **Streamed eraser path:** while erasing, `pollStrokesJson` queues the points
+  gathered so far as an `{e=1,...}` chunk, so strokes are deleted mid-gesture.
+  The SDK's repeated full point list is ignored once per-move points arrived
+  (erasing the same path twice is a no-op anyway).
+- **Immediate refresh:** an erase batch flushes the pending refresh at once
+  (there is no live hardware ink for the eraser to cover a delay).
+- **Direct erase repaint:** while a pen session is active, `onPaintPage`
+  copies the page (before ink) into `page_snapshot` (screen-sized buffer of
+  `Screen.bb`'s type, ~10MB RGB32 on the Max Lumi). `paintInkDirect(region,
+  erased)` restores the erased box from it, composites the remaining ink, and
+  refreshes only that box. Falls back to the full repaint when the snapshot is
+  missing/invalid (e.g. first erase right after opening a book, since the
+  session starts after the first paint) or a window is above the reader.
